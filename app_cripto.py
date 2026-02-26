@@ -44,6 +44,8 @@ st.markdown("""
 html, body, [class*="css"] {
     font-family: 'DM Sans', sans-serif;
     background: #08090c;
+    color: #c0c8d8;
+    font-weight: 500;
 }
 
 /* ── Scanline texture overlay ── */
@@ -76,7 +78,8 @@ body::before {
     font-family: 'IBM Plex Mono', monospace;
     font-size: 0.68rem;
     letter-spacing: 4px;
-    color: #4a5568;
+    font-weight: 600;
+    color: #8892a4;
     text-transform: uppercase;
     margin-bottom: 0.3rem;
 }
@@ -134,7 +137,7 @@ body::before {
     font-size: 0.62rem;
     letter-spacing: 3px;
     text-transform: uppercase;
-    color: #3a4055;
+    color: #8892a4;
     margin-bottom: 0.5rem;
 }
 .prob-val {
@@ -191,14 +194,14 @@ body::before {
     font-size: 0.58rem;
     letter-spacing: 3px;
     text-transform: uppercase;
-    color: #3a4055;
+    color: #8892a4;
     margin-bottom: 0.3rem;
 }
 .info-val {
     font-family: 'IBM Plex Mono', monospace;
     font-size: 1.1rem;
-    font-weight: 600;
-    color: #c8ccdb;
+    font-weight: 700;
+    color: #e8edf5;
 }
 
 /* ── Indicator rows ── */
@@ -206,7 +209,8 @@ body::before {
     font-family: 'IBM Plex Mono', monospace;
     font-size: 0.62rem;
     letter-spacing: 3px;
-    color: #3a4055;
+    font-weight: 700;
+    color: #6b7894;
     text-transform: uppercase;
     margin: 1.2rem 0 0.5rem;
     border-bottom: 1px solid #141620;
@@ -221,15 +225,15 @@ body::before {
     border-bottom: 1px solid #0e1018;
 }
 .ind-dot { width:6px; height:6px; border-radius:50%; }
-.ind-name { font-family:'IBM Plex Mono',monospace; font-size:0.72rem; color:#4a5568; }
-.ind-val  { font-family:'IBM Plex Mono',monospace; font-size:0.72rem; color:#2d3448; text-align:left; }
-.ind-sig  { font-family:'DM Sans',sans-serif; font-size:0.72rem; font-weight:500; text-align:right; }
+.ind-name { font-family:'IBM Plex Mono',monospace; font-size:0.72rem; font-weight:600; color:#8892a4; }
+.ind-val  { font-family:'IBM Plex Mono',monospace; font-size:0.72rem; font-weight:500; color:#5a6480; text-align:left; }
+.ind-sig  { font-family:'DM Sans',sans-serif; font-size:0.72rem; font-weight:700; text-align:right; }
 
 /* ── Refresh badge ── */
 .refresh-badge {
     font-family: 'IBM Plex Mono', monospace;
     font-size: 0.62rem;
-    color: #3a4055;
+    color: #8892a4;
     letter-spacing: 2px;
 }
 
@@ -309,18 +313,31 @@ with st.sidebar:
     st.divider()
 
     # Sugerencias rápidas
-    st.markdown("<div style='font-family:\"IBM Plex Mono\",monospace; font-size:0.6rem; letter-spacing:3px; color:#3a4055; margin-bottom:0.5rem;'>PARES POPULARES</div>", unsafe_allow_html=True)
+    st.markdown("<div style='font-family:\"IBM Plex Mono\",monospace; font-size:0.6rem; letter-spacing:3px; color:#8892a4; font-weight:700; margin-bottom:0.5rem;'>TOP 12 CRIPTOS</div>", unsafe_allow_html=True)
     col_s1, col_s2 = st.columns(2)
-    sugerencias = ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","DOGEUSDT"]
-    for i, sug in enumerate(sugerencias):
+    sugerencias = [
+        ("BTC",  "₿ BTC"),
+        ("ETH",  "Ξ ETH"),
+        ("SOL",  "◎ SOL"),
+        ("XRP",  "✕ XRP"),
+        ("BNB",  "⬡ BNB"),
+        ("DOGE", "Ð DOGE"),
+        ("ADA",  "₳ ADA"),
+        ("AVAX", "▲ AVAX"),
+        ("DOT",  "● DOT"),
+        ("LINK", "⬡ LINK"),
+        ("LTC",  "Ł LTC"),
+        ("ATOM", "⚛ ATOM"),
+    ]
+    for i, (sym_key, label) in enumerate(sugerencias):
         col = col_s1 if i % 2 == 0 else col_s2
-        if col.button(sug, key=f"sug_{sug}", use_container_width=True):
-            symbol_input = sug
+        if col.button(label, key=f"sug_{sym_key}", use_container_width=True):
+            symbol_input = sym_key
             analizar_btn = True
 
     st.divider()
     st.markdown("""
-    <div style='font-size:0.65rem; color:#2a2f40; line-height:1.8; font-family:"IBM Plex Mono",monospace;'>
+    <div style='font-size:0.65rem; color:#6b7894; line-height:1.8; font-weight:600; font-family:"IBM Plex Mono",monospace;'>
     FUENTE: Kraken API<br>
     AUTH: No requerida<br>
     VELAS: 1m + 5m<br>
@@ -392,9 +409,10 @@ if not analizar_btn and not auto_refresh:
 # ─────────────────────────────────────────────
 # ANÁLISIS
 # ─────────────────────────────────────────────
-sym = normalizar_symbol(symbol_input)
+kraken_pair, sym_display = normalizar_symbol(symbol_input)
+sym = kraken_pair  # par para API; sym_display para mostrar
 
-with st.spinner(f"Conectando con Kraken · {sym}…"):
+with st.spinner(f"Conectando con Kraken · {sym_display}…"):
     df, df5, book, futures_data, info, error = descargar_datos(symbol_input)
 
 if error or df is None:
@@ -426,7 +444,7 @@ st.markdown(f"""
 
     <!-- Dirección + señal -->
     <div>
-      <div class="hero-ticker">⚡ {sym} · PREDICCIÓN +5 MINUTOS · {ts}</div>
+      <div class="hero-ticker">⚡ {sym_display} · PREDICCIÓN +5 MINUTOS · {ts}</div>
       <div class="hero-direction">{pred['direccion']}</div>
       <div>
         <span class="hero-signal" style="color:{acento}; border-color:{acento}60;">
@@ -448,7 +466,7 @@ st.markdown(f"""
                     font-weight:700; color:{acento};">
           ${pred['precio_objetivo']:,.4f}
         </div>
-        <div style="font-family:'IBM Plex Mono',monospace; font-size:0.68rem; color:#2a2f40; margin-top:0.2rem;">
+        <div style="font-family:'IBM Plex Mono',monospace; font-size:0.68rem; color:#8892a4; font-weight:600; margin-top:0.2rem;">
           {'↑' if pred['score'] > 0 else '↓'} {pred['mov_estimado']:.4f}% estimado
           · ATR {pred['atr_pct']:.3f}%
         </div>
@@ -464,7 +482,7 @@ st.markdown(f"""
         {pred['score']:+.3f}
       </div>
       <div style="font-family:'IBM Plex Mono',monospace; font-size:0.6rem;
-                  color:#2a2f40; margin-top:0.2rem;">escala −1 a +1</div>
+                  color:#6b7894; margin-top:0.2rem;">escala −1 a +1</div>
       <div class="counter-row" style="margin-top:0.8rem;">
         <span style="color:#00e87a;">▲ {pred['alcistas']}</span>
         <span style="color:#3a4055;">◎ {pred['neutros']}</span>
@@ -489,7 +507,7 @@ def prob_box(label, pct, color, sublabel=""):
              box-shadow: 0 0 8px {fill_color}60;"></div>
       </div>
       <div style="font-family:'IBM Plex Mono',monospace; font-size:0.6rem;
-                  color:#2a2f40; margin-top:0.4rem;">{sublabel}</div>
+                  color:#8892a4; font-weight:600; margin-top:0.4rem;">{sublabel}</div>
     </div>
     """
 
@@ -595,7 +613,7 @@ with tab_charts:
     ax1.axhline(precio, color="yellow", lw=0.8, ls="--", alpha=0.4)
     ax1.legend(loc="upper left", facecolor=PAN, labelcolor="#3a4055",
                fontsize=7.5, framealpha=0.9, edgecolor=GRID)
-    style(ax1, f"PRECIO 1M — {sym}  |  EMA7 · EMA25 · BOLLINGER (20)")
+    style(ax1, f"PRECIO 1M — {sym_display}  |  EMA7 · EMA25 · BOLLINGER (20)")
 
     # ── 2. Volumen con color compra/venta ──
     ax2 = fig.add_subplot(gs[1, :2])
@@ -704,7 +722,7 @@ with tab_charts:
                    fontsize=7.5, fontfamily="monospace")
     style(ax8, "SCORE POR INDICADOR")
 
-    plt.suptitle(f"{sym}  ·  ANÁLISIS 5MIN  ·  {ts}",
+    plt.suptitle(f"{sym_display}  ·  ANÁLISIS 5MIN  ·  {ts}",
                  color="#2a2f40", fontsize=9, fontfamily="monospace", y=1.01)
     st.pyplot(fig, use_container_width=True)
     plt.close()
@@ -756,7 +774,7 @@ with tab_book:
         with col_b:
             st.markdown(f"""
             <div class="ind-bloque-title" style="color:#00e87a;">
-              BIDS (COMPRAS) — {bid_total:.4f} {sym.replace('USDT','')}
+              BIDS (COMPRAS) — {bid_total:.4f} {info['nombre'].split('/')[0]}
             </div>""", unsafe_allow_html=True)
             max_bid_vol = max(b[1] for b in bids_raw)
             for price_b, vol_b in bids_raw:
@@ -768,7 +786,7 @@ with tab_book:
                               width:{bar_w:.0f}%; min-width:4px; height:16px;
                               border-right:2px solid #00e87a;"></div>
                   <div style="font-size:0.72rem; color:#00e87a; min-width:90px;">${price_b:,.4f}</div>
-                  <div style="font-size:0.65rem; color:#3a4055;">{vol_b:.4f}</div>
+                  <div style="font-size:0.65rem; color:#8892a4; font-weight:600;">{vol_b:.4f}</div>
                 </div>""", unsafe_allow_html=True)
 
         with col_mid:
@@ -785,14 +803,14 @@ with tab_book:
                 {obi:+.1f}%
               </div>
               <div style="font-family:'IBM Plex Mono',monospace; font-size:0.6rem;
-                          color:#2a2f40; margin-top:0.3rem;">Order Book<br>Imbalance</div>
+                          color:#8892a4; font-weight:600; margin-top:0.3rem;">Order Book<br>Imbalance</div>
             </div>
             """, unsafe_allow_html=True)
 
         with col_a:
             st.markdown(f"""
             <div class="ind-bloque-title" style="color:#ff4f6a; text-align:right;">
-              ASKS (VENTAS) — {ask_total:.4f} {sym.replace('USDT','')}
+              ASKS (VENTAS) — {ask_total:.4f} {info['nombre'].split('/')[0]}
             </div>""", unsafe_allow_html=True)
             max_ask_vol = max(a[1] for a in asks_raw)
             for price_a, vol_a in asks_raw:
@@ -801,7 +819,7 @@ with tab_book:
                 <div style="display:flex; align-items:center; justify-content:flex-end;
                             gap:0.5rem; padding:0.2rem 0;
                             font-family:'IBM Plex Mono',monospace;">
-                  <div style="font-size:0.65rem; color:#3a4055;">{vol_a:.4f}</div>
+                  <div style="font-size:0.65rem; color:#8892a4; font-weight:600;">{vol_a:.4f}</div>
                   <div style="font-size:0.72rem; color:#ff4f6a; min-width:90px;
                               text-align:right;">${price_a:,.4f}</div>
                   <div style="background:#ff4f6a18; border-radius:2px;
