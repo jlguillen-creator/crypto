@@ -2,7 +2,7 @@
 Crypto Predictor 5min — Streamlit App
 Predictor de movimiento de criptomonedas para los próximos 5 minutos
 basado en 20 indicadores de microestructura, momentum y derivados.
-Fuente de datos: Binance Public API (sin API key)
+Fuente de datos: Kraken Public API (sin API key)
 """
 
 import streamlit as st
@@ -291,7 +291,7 @@ with st.sidebar:
     st.markdown("""
     <div style='font-size:0.75rem; color:#3a4055; line-height:1.7; margin-bottom:1rem;'>
     Análisis de 20 indicadores de microestructura, momentum y derivados
-    sobre datos de Binance en tiempo real.
+    sobre datos de Kraken en tiempo real.
     </div>
     """, unsafe_allow_html=True)
 
@@ -321,7 +321,7 @@ with st.sidebar:
     st.divider()
     st.markdown("""
     <div style='font-size:0.65rem; color:#2a2f40; line-height:1.8; font-family:"IBM Plex Mono",monospace;'>
-    FUENTE: Binance API<br>
+    FUENTE: Kraken API<br>
     AUTH: No requerida<br>
     VELAS: 1m + 5m<br>
     ORDER BOOK: Top 20<br>
@@ -363,7 +363,7 @@ if not analizar_btn and not auto_refresh:
             <div style='background:#0c0e14; border:1px solid #1a1e2a; border-radius:4px;
                         padding:0.8rem 1.2rem; font-family:"IBM Plex Mono",monospace;
                         font-size:0.7rem; color:#3a4055; letter-spacing:2px;'>
-                📡 BINANCE REAL-TIME
+                📡 KRAKEN REAL-TIME
             </div>
             <div style='background:#0c0e14; border:1px solid #1a1e2a; border-radius:4px;
                         padding:0.8rem 1.2rem; font-family:"IBM Plex Mono",monospace;
@@ -394,7 +394,7 @@ if not analizar_btn and not auto_refresh:
 # ─────────────────────────────────────────────
 sym = normalizar_symbol(symbol_input)
 
-with st.spinner(f"Conectando con Binance · {sym}…"):
+with st.spinner(f"Conectando con Kraken · {sym}…"):
     df, df5, book, futures_data, info, error = descargar_datos(symbol_input)
 
 if error or df is None:
