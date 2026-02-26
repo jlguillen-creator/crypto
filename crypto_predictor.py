@@ -1,6 +1,6 @@
 """
 Módulo de lógica central — Crypto Predictor 5min
-Fuente de datos: Binance Public API (sin API key)
+Fuente de datos: Kraken Public REST API (sin API key, sin restricciones geográficas)
 20 indicadores adaptados a trading intraday de criptomonedas
 """
 
@@ -18,177 +18,202 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 ssl._create_default_https_context = ssl._create_unverified_context
 os.environ['PYTHONHTTPSVERIFY'] = '0'
 
-BINANCE_BASE    = "https://api.binance.com/api/v3"
-BINANCE_FUTURES = "https://fapi.binance.com/fapi/v1"
-BINANCE_FDATA   = "https://fapi.binance.com/futures/data"
-
+KRAKEN_BASE = "https://api.kraken.com/0/public"
 
 # ─────────────────────────────────────────────
-# CLIENTE BINANCE (sin autenticación)
+# CLIENTE HTTP
 # ─────────────────────────────────────────────
-
-# Proxy opcional — configura si estás detrás de un proxy corporativo
-# Ejemplo: HTTPS_PROXY=http://proxy.empresa.com:8080
-_PROXIES = None
-if os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy"):
-    _proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
-    _PROXIES = {"https": _proxy_url, "http": _proxy_url}
 
 def _get(url, params=None):
     try:
-        r = requests.get(url, params=params, verify=False, timeout=10,
-                         proxies=_PROXIES)
+        r = requests.get(url, params=params, verify=False, timeout=12)
         if r.status_code == 200:
-            return r.json()
-        if r.status_code == 451:
-            # Binance bloqueada por región — marcar para fallback
-            raise ConnectionError("BINANCE_GEO_BLOCKED")
+            data = r.json()
+            # Kraken envuelve errores dentro del JSON
+            if isinstance(data, dict) and data.get("error"):
+                return None
+            return data
         return None
-    except ConnectionError:
-        raise
     except Exception:
         return None
 
 
-def _get_safe(url, params=None):
-    """Wrapper que nunca lanza excepción — devuelve None si falla."""
-    try:
-        return _get(url, params)
-    except Exception:
-        return None
+# ─────────────────────────────────────────────
+# NORMALIZACIÓN DE SÍMBOLO → formato Kraken
+# ─────────────────────────────────────────────
 
+# Mapa de alias comunes → par Kraken
+_KRAKEN_ALIASES = {
+    "BTCUSDT": "XBTUSD",  "BTCUSD":  "XBTUSD",  "BTC":  "XBTUSD",
+    "ETHUSDT": "ETHUSD",  "ETHUSD":  "ETHUSD",   "ETH":  "ETHUSD",
+    "SOLUSDT": "SOLUSD",  "SOLUSD":  "SOLUSD",   "SOL":  "SOLUSD",
+    "BNBUSDT": "BNBUSD",  "BNBUSD":  "BNBUSD",   "BNB":  "BNBUSD",
+    "XRPUSDT": "XRPUSD",  "XRPUSD":  "XRPUSD",   "XRP":  "XRPUSD",
+    "ADAUSDT": "ADAUSD",  "ADA":     "ADAUSD",
+    "DOGEUSDT":"XDGUSD",  "DOGEUSD": "XDGUSD",   "DOGE": "XDGUSD",
+    "DOTUSDT": "DOTUSD",  "DOT":     "DOTUSD",
+    "AVAXUSDT":"AVAXUSD", "AVAX":    "AVAXUSD",
+    "LINKUSDT":"LINKUSD", "LINK":    "LINKUSD",
+    "LTCUSDT": "XLTCZUSD","LTCUSD":  "XLTCZUSD", "LTC":  "XLTCZUSD",
+    "MATICUSDT":"MATICUSD","MATIC":  "MATICUSD",
+    "UNIUSDT": "UNIUSD",  "UNI":     "UNIUSD",
+    "ATOMUSDT": "ATOMUSD", "ATOM":   "ATOMUSD",
+    "NEARUSDT": "NEARUSD", "NEAR":   "NEARUSD",
+    "AAVEUSD":  "AAVEUSD", "AAVEUSDT":"AAVEUSD", "AAVE":"AAVEUSD",
+    "ALGOUSDT": "ALGOUSD", "ALGO":   "ALGOUSD",
+    "XLMUSDT":  "XXLMZUSD","XLM":    "XXLMZUSD",
+    "TRXUSDT":  "TRXUSD",  "TRX":    "TRXUSD",
+    "FILUSDT":  "FILUSD",  "FIL":    "FILUSD",
+}
 
-def normalizar_symbol(symbol: str) -> str:
-    """Convierte BTC, BTCUSDT, BTC/USDT → BTCUSDT"""
-    s = symbol.upper().replace("/", "").replace("-", "")
-    if not s.endswith("USDT") and not s.endswith("BUSD") and not s.endswith("BTC"):
-        s = s + "USDT"
-    return s
+def normalizar_symbol(symbol: str) -> tuple:
+    """
+    Devuelve (kraken_pair, display_name).
+    Ejemplo: "ETH" → ("ETHUSD", "ETH/USD")
+    """
+    s = symbol.upper().strip().replace("/","").replace("-","").replace("_","")
+    # Intentar alias directo
+    if s in _KRAKEN_ALIASES:
+        pair = _KRAKEN_ALIASES[s]
+        display = s.replace("USDT","").replace("USD","") + "/USD"
+        return pair, display
+    # Si termina en USD o USDT lo usamos tal cual (Kraken puede aceptarlo)
+    if s.endswith("USD"):
+        return s, s[:-3] + "/USD"
+    if s.endswith("USDT"):
+        return s[:-1], s[:-4] + "/USD"  # ETHUSDT → ETHUSD
+    # Asumir base vs USD
+    return s + "USD", s + "/USD"
 
 
 # ─────────────────────────────────────────────
-# DESCARGA DE DATOS
+# DESCARGA DE DATOS — KRAKEN
 # ─────────────────────────────────────────────
-
-def _test_conectividad():
-    """Comprueba si Binance es alcanzable. Devuelve (ok, mensaje)."""
-    try:
-        r = requests.get(f"{BINANCE_BASE}/ping", verify=False, timeout=6,
-                         proxies=_PROXIES)
-        if r.status_code == 200:
-            return True, ""
-        return False, f"Binance respondió HTTP {r.status_code}"
-    except Exception as e:
-        msg = str(e)
-        if "Max retries" in msg or "NameResolution" in msg or "ConnectionError" in msg:
-            return False, (
-                "No se puede conectar con Binance. Posibles causas:\n"
-                "• Binance bloqueada en tu red/region\n"
-                "• Proxy corporativo: configura HTTPS_PROXY\n"
-                "• Sin acceso a internet\n\n"
-                "En Streamlit Cloud funciona sin restricciones."
-            )
-        return False, f"Error de red: {msg[:200]}"
-
 
 def descargar_datos(symbol: str):
-    sym = normalizar_symbol(symbol)
+    pair, display = normalizar_symbol(symbol)
 
-    # ── Test de conectividad previo ──
-    ok, err_msg = _test_conectividad()
-    if not ok:
-        return None, None, None, None, None, err_msg
+    # ── Test de conectividad ──
+    ping = _get(f"{KRAKEN_BASE}/Time")
+    if ping is None:
+        return None, None, None, None, None, (
+            "No se puede conectar con Kraken API. "
+            "Comprueba tu conexión a internet."
+        )
 
-    # ── Velas 1 minuto: últimas 100 (para calcular indicadores) ──
-    klines_raw = _get_safe(f"{BINANCE_BASE}/klines",
-                           {"symbol": sym, "interval": "1m", "limit": 100})
-    if not klines_raw:
-        # Distinguir símbolo inválido de fallo de red
-        exchange_info = _get_safe(f"{BINANCE_BASE}/exchangeInfo")
-        if exchange_info:
-            symbols_validos = [s["symbol"] for s in exchange_info.get("symbols", [])]
-            if sym not in symbols_validos:
-                sugerencia = next((s for s in symbols_validos if s.startswith(sym[:3])), None)
-                msg = f"Símbolo '{sym}' no encontrado en Binance."
-                if sugerencia:
-                    msg += f" ¿Quisiste decir {sugerencia}?"
-                return None, None, None, None, None, msg
-        return None, None, None, None, None, f"No se pudieron obtener datos para {sym}. Intenta de nuevo."
+    # ── OHLC 1 minuto (hasta 720 velas) ──
+    ohlc_raw = _get(f"{KRAKEN_BASE}/OHLC", {"pair": pair, "interval": 1})
+    if not ohlc_raw or "result" not in ohlc_raw:
+        # Intentar buscar el par en Kraken
+        assets = _get(f"{KRAKEN_BASE}/AssetPairs", {"pair": pair})
+        if assets and "result" in assets:
+            alt_pair = list(assets["result"].keys())[0]
+            ohlc_raw = _get(f"{KRAKEN_BASE}/OHLC", {"pair": alt_pair, "interval": 1})
+        if not ohlc_raw or "result" not in ohlc_raw:
+            return None, None, None, None, None, (
+                f"Par '{pair}' no encontrado en Kraken. "
+                f"Prueba con: BTC, ETH, SOL, XRP, DOGE, ADA, DOT, AVAX, LINK, LTC..."
+            )
 
-    df = pd.DataFrame(klines_raw, columns=[
-        "open_time", "open", "high", "low", "close", "volume",
-        "close_time", "quote_volume", "trades", "taker_buy_base",
-        "taker_buy_quote", "ignore"
+    # Extraer datos OHLC — Kraken devuelve {pair_name: [[time,o,h,l,c,vwap,vol,count],...], "last": ...}
+    result_key = [k for k in ohlc_raw["result"] if k != "last"][0]
+    ohlc_data  = ohlc_raw["result"][result_key]
+
+    # Tomar las últimas 100 velas (excluir la última incompleta)
+    ohlc_data = ohlc_data[-101:-1]
+    if len(ohlc_data) < 20:
+        return None, None, None, None, None, (
+            f"Datos insuficientes para {pair} (solo {len(ohlc_data)} velas)."
+        )
+
+    df = pd.DataFrame(ohlc_data, columns=[
+        "time","open","high","low","close","vwap","volume","count"
     ])
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
-    df = df.set_index("open_time")
-    for col in ["open","high","low","close","volume","quote_volume",
-                "taker_buy_base","taker_buy_quote"]:
+    df["time"] = pd.to_datetime(df["time"], unit="s")
+    df = df.set_index("time")
+    for col in ["open","high","low","close","vwap","volume"]:
         df[col] = df[col].astype(float)
-    df["trades"] = df["trades"].astype(int)
+    df["count"] = df["count"].astype(int)
+    # Añadir columnas que espera calcular_indicadores
+    # taker_buy_quote: aproximamos con 60% del volumen en velas alcistas
+    df["quote_volume"]     = df["volume"] * df["close"]
+    df["taker_buy_quote"]  = df.apply(
+        lambda r: r["quote_volume"] * 0.6 if r["close"] >= r["open"]
+                  else r["quote_volume"] * 0.4, axis=1
+    )
+    df["trades"] = df["count"]
+    df["taker_buy_base"] = df.apply(
+        lambda r: r["volume"] * 0.6 if r["close"] >= r["open"]
+                  else r["volume"] * 0.4, axis=1
+    )
 
-    # ── Velas 5 minutos: últimas 50 (contexto más amplio) ──
-    klines_5m = _get_safe(f"{BINANCE_BASE}/klines",
-                     {"symbol": sym, "interval": "5m", "limit": 50})
+    # ── OHLC 5 minutos ──
+    ohlc5_raw = _get(f"{KRAKEN_BASE}/OHLC", {"pair": pair, "interval": 5})
     df5 = None
-    if klines_5m:
-        df5 = pd.DataFrame(klines_5m, columns=[
-            "open_time","open","high","low","close","volume",
-            "close_time","quote_volume","trades","taker_buy_base",
-            "taker_buy_quote","ignore"
-        ])
-        df5["open_time"] = pd.to_datetime(df5["open_time"], unit="ms")
-        df5 = df5.set_index("open_time")
-        for col in ["open","high","low","close","volume","quote_volume"]:
-            df5[col] = df5[col].astype(float)
+    if ohlc5_raw and "result" in ohlc5_raw:
+        key5 = [k for k in ohlc5_raw["result"] if k != "last"][0]
+        d5   = ohlc5_raw["result"][key5][-51:-1]
+        if len(d5) >= 5:
+            df5 = pd.DataFrame(d5, columns=[
+                "time","open","high","low","close","vwap","volume","count"
+            ])
+            df5["time"] = pd.to_datetime(df5["time"], unit="s")
+            df5 = df5.set_index("time")
+            for col in ["open","high","low","close","vwap","volume"]:
+                df5[col] = df5[col].astype(float)
 
-    # ── Order book (depth 20) ──
-    book = _get_safe(f"{BINANCE_BASE}/depth", {"symbol": sym, "limit": 20})
+    # ── Order Book ──
+    book_raw = _get(f"{KRAKEN_BASE}/Depth", {"pair": pair, "count": 20})
+    book = None
+    if book_raw and "result" in book_raw:
+        bk_key = [k for k in book_raw["result"]][0]
+        raw_bk = book_raw["result"][bk_key]
+        book = {
+            "bids": [[float(b[0]), float(b[1])] for b in raw_bk.get("bids", [])],
+            "asks": [[float(a[0]), float(a[1])] for a in raw_bk.get("asks", [])],
+        }
 
-    # ── Ticker 24h ──
-    ticker = _get_safe(f"{BINANCE_BASE}/ticker/24hr", {"symbol": sym})
+    # ── Ticker (precio actual y estadísticas 24h) ──
+    ticker_raw = _get(f"{KRAKEN_BASE}/Ticker", {"pair": pair})
+    precio_actual = float(df["close"].iloc[-1])
+    precio_prev   = float(df["close"].iloc[-2])
+    cambio_pct    = 0.0
+    vol_24h = high_24h = low_24h = 0.0
 
-    # ── Precio actual ──
-    price_raw = _get_safe(f"{BINANCE_BASE}/ticker/price", {"symbol": sym})
-    precio_actual = float(price_raw["price"]) if price_raw else df["close"].iloc[-1]
+    if ticker_raw and "result" in ticker_raw:
+        tk_key = list(ticker_raw["result"].keys())[0]
+        tk     = ticker_raw["result"][tk_key]
+        # Kraken ticker: c=[last_price, lot_volume], h=[today,24h_high], l=[today,24h_low]
+        # v=[today_vol, 24h_vol], o=open_price
+        precio_actual = float(tk["c"][0])
+        open_price    = float(tk["o"])
+        cambio_pct    = (precio_actual / open_price - 1) * 100 if open_price else 0
+        vol_24h  = float(tk["v"][1]) * precio_actual
+        high_24h = float(tk["h"][1])
+        low_24h  = float(tk["l"][1])
 
-    # ── Datos de futuros (funding rate, open interest) ── opcional
-    futures_data = {}
-    # Intentar símbolo perpetuo
-    perp_sym = sym if sym.endswith("USDT") else sym + "USDT"
-    funding = _get_safe(f"{BINANCE_FUTURES}/premiumIndex", {"symbol": perp_sym})
-    if funding:
-        futures_data["funding_rate"]    = float(funding.get("lastFundingRate", 0))
-        futures_data["mark_price"]      = float(funding.get("markPrice", precio_actual))
-        futures_data["index_price"]     = float(funding.get("indexPrice", precio_actual))
+    # ── Spreads recientes (Kraken ofrece esto gratis) ──
+    spread_raw = _get(f"{KRAKEN_BASE}/Spread", {"pair": pair})
+    spread_data = []
+    if spread_raw and "result" in spread_raw:
+        sp_key = [k for k in spread_raw["result"] if k != "last"][0]
+        spread_data = spread_raw["result"][sp_key][-10:]  # últimos 10 spreads
 
-    oi = _get_safe(f"{BINANCE_FUTURES}/openInterest", {"symbol": perp_sym})
-    if oi:
-        futures_data["open_interest"] = float(oi.get("openInterest", 0))
-
-    # OI histórico (cambio)
-    oi_hist = _get_safe(f"{BINANCE_FDATA}/openInterestHist",
-                   {"symbol": perp_sym, "period": "5m", "limit": 6})
-    if oi_hist and isinstance(oi_hist, list) and len(oi_hist) >= 2:
-        oi_vals = [float(x["sumOpenInterest"]) for x in oi_hist]
-        futures_data["oi_change_pct"] = (oi_vals[-1] / oi_vals[0] - 1) * 100 if oi_vals[0] else 0
-
-    # Long/Short ratio
-    ls = _get_safe(f"{BINANCE_FDATA}/globalLongShortAccountRatio",
-              {"symbol": perp_sym, "period": "5m", "limit": 1})
-    if ls and isinstance(ls, list) and ls:
-        futures_data["long_ratio"]  = float(ls[0].get("longAccount", 0.5))
-        futures_data["short_ratio"] = float(ls[0].get("shortAccount", 0.5))
+    futures_data = {
+        "spread_history": spread_data,
+        # Kraken no tiene futuros perpetuos en la misma API spot
+        # → estos indicadores mostrarán N/A correctamente
+    }
 
     info = {
-        "symbol":        sym,
-        "nombre":        sym,
+        "symbol":        pair,
+        "nombre":        display,
         "precio_actual": precio_actual,
-        "precio_prev":   float(ticker["prevClosePrice"]) if ticker else df["close"].iloc[-2],
-        "cambio_pct":    float(ticker["priceChangePercent"]) if ticker else 0,
-        "vol_24h":       float(ticker["quoteVolume"]) if ticker else 0,
-        "high_24h":      float(ticker["highPrice"]) if ticker else 0,
-        "low_24h":       float(ticker["lowPrice"]) if ticker else 0,
+        "precio_prev":   precio_prev,
+        "cambio_pct":    cambio_pct,
+        "vol_24h":       vol_24h,
+        "high_24h":      high_24h,
+        "low_24h":       low_24h,
     }
 
     return df, df5, book, futures_data, info, None
