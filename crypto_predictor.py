@@ -27,12 +27,33 @@ BINANCE_FDATA   = "https://fapi.binance.com/futures/data"
 # CLIENTE BINANCE (sin autenticación)
 # ─────────────────────────────────────────────
 
+# Proxy opcional — configura si estás detrás de un proxy corporativo
+# Ejemplo: HTTPS_PROXY=http://proxy.empresa.com:8080
+_PROXIES = None
+if os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy"):
+    _proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+    _PROXIES = {"https": _proxy_url, "http": _proxy_url}
+
 def _get(url, params=None):
     try:
-        r = requests.get(url, params=params, verify=False, timeout=10)
+        r = requests.get(url, params=params, verify=False, timeout=10,
+                         proxies=_PROXIES)
         if r.status_code == 200:
             return r.json()
+        if r.status_code == 451:
+            # Binance bloqueada por región — marcar para fallback
+            raise ConnectionError("BINANCE_GEO_BLOCKED")
         return None
+    except ConnectionError:
+        raise
+    except Exception:
+        return None
+
+
+def _get_safe(url, params=None):
+    """Wrapper que nunca lanza excepción — devuelve None si falla."""
+    try:
+        return _get(url, params)
     except Exception:
         return None
 
@@ -49,14 +70,50 @@ def normalizar_symbol(symbol: str) -> str:
 # DESCARGA DE DATOS
 # ─────────────────────────────────────────────
 
+def _test_conectividad():
+    """Comprueba si Binance es alcanzable. Devuelve (ok, mensaje)."""
+    try:
+        r = requests.get(f"{BINANCE_BASE}/ping", verify=False, timeout=6,
+                         proxies=_PROXIES)
+        if r.status_code == 200:
+            return True, ""
+        return False, f"Binance respondió HTTP {r.status_code}"
+    except Exception as e:
+        msg = str(e)
+        if "Max retries" in msg or "NameResolution" in msg or "ConnectionError" in msg:
+            return False, (
+                "No se puede conectar con Binance. Posibles causas:\n"
+                "• Binance bloqueada en tu red/region\n"
+                "• Proxy corporativo: configura HTTPS_PROXY\n"
+                "• Sin acceso a internet\n\n"
+                "En Streamlit Cloud funciona sin restricciones."
+            )
+        return False, f"Error de red: {msg[:200]}"
+
+
 def descargar_datos(symbol: str):
     sym = normalizar_symbol(symbol)
 
+    # ── Test de conectividad previo ──
+    ok, err_msg = _test_conectividad()
+    if not ok:
+        return None, None, None, None, None, err_msg
+
     # ── Velas 1 minuto: últimas 100 (para calcular indicadores) ──
-    klines_raw = _get(f"{BINANCE_BASE}/klines",
-                      {"symbol": sym, "interval": "1m", "limit": 100})
+    klines_raw = _get_safe(f"{BINANCE_BASE}/klines",
+                           {"symbol": sym, "interval": "1m", "limit": 100})
     if not klines_raw:
-        return None, None, None, None, None, f"No se encontraron datos para {sym}. Verifica el símbolo."
+        # Distinguir símbolo inválido de fallo de red
+        exchange_info = _get_safe(f"{BINANCE_BASE}/exchangeInfo")
+        if exchange_info:
+            symbols_validos = [s["symbol"] for s in exchange_info.get("symbols", [])]
+            if sym not in symbols_validos:
+                sugerencia = next((s for s in symbols_validos if s.startswith(sym[:3])), None)
+                msg = f"Símbolo '{sym}' no encontrado en Binance."
+                if sugerencia:
+                    msg += f" ¿Quisiste decir {sugerencia}?"
+                return None, None, None, None, None, msg
+        return None, None, None, None, None, f"No se pudieron obtener datos para {sym}. Intenta de nuevo."
 
     df = pd.DataFrame(klines_raw, columns=[
         "open_time", "open", "high", "low", "close", "volume",
@@ -71,7 +128,7 @@ def descargar_datos(symbol: str):
     df["trades"] = df["trades"].astype(int)
 
     # ── Velas 5 minutos: últimas 50 (contexto más amplio) ──
-    klines_5m = _get(f"{BINANCE_BASE}/klines",
+    klines_5m = _get_safe(f"{BINANCE_BASE}/klines",
                      {"symbol": sym, "interval": "5m", "limit": 50})
     df5 = None
     if klines_5m:
@@ -86,38 +143,38 @@ def descargar_datos(symbol: str):
             df5[col] = df5[col].astype(float)
 
     # ── Order book (depth 20) ──
-    book = _get(f"{BINANCE_BASE}/depth", {"symbol": sym, "limit": 20})
+    book = _get_safe(f"{BINANCE_BASE}/depth", {"symbol": sym, "limit": 20})
 
     # ── Ticker 24h ──
-    ticker = _get(f"{BINANCE_BASE}/ticker/24hr", {"symbol": sym})
+    ticker = _get_safe(f"{BINANCE_BASE}/ticker/24hr", {"symbol": sym})
 
     # ── Precio actual ──
-    price_raw = _get(f"{BINANCE_BASE}/ticker/price", {"symbol": sym})
+    price_raw = _get_safe(f"{BINANCE_BASE}/ticker/price", {"symbol": sym})
     precio_actual = float(price_raw["price"]) if price_raw else df["close"].iloc[-1]
 
     # ── Datos de futuros (funding rate, open interest) ── opcional
     futures_data = {}
     # Intentar símbolo perpetuo
     perp_sym = sym if sym.endswith("USDT") else sym + "USDT"
-    funding = _get(f"{BINANCE_FUTURES}/premiumIndex", {"symbol": perp_sym})
+    funding = _get_safe(f"{BINANCE_FUTURES}/premiumIndex", {"symbol": perp_sym})
     if funding:
         futures_data["funding_rate"]    = float(funding.get("lastFundingRate", 0))
         futures_data["mark_price"]      = float(funding.get("markPrice", precio_actual))
         futures_data["index_price"]     = float(funding.get("indexPrice", precio_actual))
 
-    oi = _get(f"{BINANCE_FUTURES}/openInterest", {"symbol": perp_sym})
+    oi = _get_safe(f"{BINANCE_FUTURES}/openInterest", {"symbol": perp_sym})
     if oi:
         futures_data["open_interest"] = float(oi.get("openInterest", 0))
 
     # OI histórico (cambio)
-    oi_hist = _get(f"{BINANCE_FDATA}/openInterestHist",
+    oi_hist = _get_safe(f"{BINANCE_FDATA}/openInterestHist",
                    {"symbol": perp_sym, "period": "5m", "limit": 6})
     if oi_hist and isinstance(oi_hist, list) and len(oi_hist) >= 2:
         oi_vals = [float(x["sumOpenInterest"]) for x in oi_hist]
         futures_data["oi_change_pct"] = (oi_vals[-1] / oi_vals[0] - 1) * 100 if oi_vals[0] else 0
 
     # Long/Short ratio
-    ls = _get(f"{BINANCE_FDATA}/globalLongShortAccountRatio",
+    ls = _get_safe(f"{BINANCE_FDATA}/globalLongShortAccountRatio",
               {"symbol": perp_sym, "period": "5m", "limit": 1})
     if ls and isinstance(ls, list) and ls:
         futures_data["long_ratio"]  = float(ls[0].get("longAccount", 0.5))
