@@ -1235,3 +1235,60 @@ def calcular_prediccion(puntuaciones, precio_actual, indicadores,
         "regime_mod":      round(regime_mod, 3),
         "pesos_efectivos": pesos_efectivos,
     }
+
+
+# ─────────────────────────────────────────────
+# SCAN RÁPIDO — score de todas las criptos
+# Solo OHLC 1m de Kraken, sin fuentes externas
+# ─────────────────────────────────────────────
+def scan_rapido(symbol: str) -> dict:
+    """
+    Descarga solo OHLC 1m y calcula score básico (sin OKX, sin F&G).
+    Devuelve {"prob_subida": float, "color": str, "direccion": str}
+    donde color es "alcista"|"bajista"|"neutro".
+    """
+    try:
+        pair, _ = normalizar_symbol(symbol)
+        df = _safe_call(_kraken_ohlc, pair, 1, 60)
+        if df is None or len(df) < 20:
+            return {"prob_subida": 50, "color": "neutro", "direccion": "?"}
+
+        # Columnas mínimas necesarias
+        df["quote_volume"]    = df["volume"] * df["close"]
+        df["taker_buy_quote"] = df.apply(
+            lambda r: r["quote_volume"] * 0.6 if r["close"] >= r["open"]
+                      else r["quote_volume"] * 0.4, axis=1)
+        df["taker_buy_base"]  = df.apply(
+            lambda r: r["volume"] * 0.6 if r["close"] >= r["open"]
+                      else r["volume"] * 0.4, axis=1)
+        df["trades"] = df["count"]
+
+        precio = float(df["close"].iloc[-1])
+        info_min = {
+            "symbol": pair, "nombre": symbol + "/USD",
+            "precio_actual": precio, "precio_prev": float(df["close"].iloc[-2]),
+            "cambio_pct": 0.0, "vol_24h": 0.0, "high_24h": precio, "low_24h": precio,
+            "okx_price": None, "base": symbol,
+        }
+        futures_min = {}
+
+        inds, _, punts, _, reg, _ = calcular_indicadores(
+            df, None, None, futures_min, info_min, None, None)
+        pred_r = calcular_prediccion(punts, precio, inds, regimen=reg, fng_data={})
+
+        prob = pred_r["prob_subida"]
+        if prob > 55:
+            color = "alcista"
+        elif prob < 45:
+            color = "bajista"
+        else:
+            color = "neutro"
+
+        return {
+            "prob_subida": prob,
+            "color":       color,
+            "direccion":   pred_r["direccion"],
+            "score":       pred_r["score"],
+        }
+    except Exception:
+        return {"prob_subida": 50, "color": "neutro", "direccion": "?"}
