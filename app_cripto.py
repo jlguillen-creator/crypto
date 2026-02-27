@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from crypto_predictor import (
     descargar_datos, calcular_indicadores,
     calcular_prediccion, BLOQUES_CRYPTO, PESOS_BASE,
-    normalizar_symbol
+    normalizar_symbol, scan_rapido
 )
 
 warnings.filterwarnings("ignore")
@@ -274,6 +274,27 @@ CRYPTOS = [
 ]
 
 # ─────────────────────────────────────────────
+# SCAN DE FONDO — se ejecuta al inicio de cada render
+# Si el cache expiró (5 min), lanza los 12 scans y rerenderiza
+# Al rerenderizar, los chips ya tienen los colores correctos
+# ─────────────────────────────────────────────
+import time as _time
+
+_scan_ts   = st.session_state.get("scan_ts", 0)
+_CACHE_TTL = 300   # 5 minutos
+
+if _time.time() - _scan_ts > _CACHE_TTL:
+    _progress = st.empty()
+    _progress.caption("⟳ Escaneando señales…")
+    _new_scores = {}
+    for _sym, _ in CRYPTOS:
+        _new_scores[_sym] = scan_rapido(_sym)
+    st.session_state["scan_scores"] = _new_scores
+    st.session_state["scan_ts"]     = _time.time()
+    _progress.empty()
+    st.rerun()
+
+# ─────────────────────────────────────────────
 # SIDEBAR (colapsado por defecto, útil en desktop)
 # ─────────────────────────────────────────────
 with st.sidebar:
@@ -322,16 +343,33 @@ chip_selected = qp.get("crypto", None)
 if chip_selected:
     st.query_params.clear()
 
+# Colores de señal del scan de fondo (session_state)
+_SCAN_BG   = {"alcista": "#00e87a", "bajista": "#ff4f6a", "neutro": "#2a3040"}
+_SCAN_BORD = {"alcista": "#00e87a", "bajista": "#ff4f6a", "neutro": "#2a3040"}
+_SCAN_TXT  = {"alcista": "#00e87a", "bajista": "#ff4f6a", "neutro": "#c8d0e0"}
+
+def _chip_style(sym_k):
+    scan = st.session_state.get("scan_scores", {}).get(sym_k, {})
+    color = scan.get("color", "neutro")
+    bg   = "#0d1a0f" if color == "alcista" else ("#1a0d0f" if color == "bajista" else "#141820")
+    bord = _SCAN_BORD[color]
+    txt  = _SCAN_TXT[color]
+    return bg, bord, txt
+
 chip_html = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:0.6rem;">'
 for sym_k, label in CRYPTOS:
+    bg, bord, txt = _chip_style(sym_k)
+    scan = st.session_state.get("scan_scores", {}).get(sym_k, {})
+    prob = scan.get("prob_subida", None)
+    prob_txt = f'<div style="font-size:0.6rem;opacity:0.8;margin-top:1px;">{prob:.0f}%</div>' if prob else ""
     chip_html += (
         f'<a href="?crypto={sym_k}" target="_self" style="' +
-        'display:block;text-align:center;text-decoration:none;' +
-        'font-family:IBM Plex Mono,monospace;font-size:0.78rem;font-weight:700;' +
-        'padding:0.5rem 0.3rem;border-radius:6px;' +
-        'background:#141820;border:1px solid #2a3040;color:#c8d0e0;' +
-        '-webkit-tap-highlight-color:transparent;' +
-        f'">{label}</a>'
+        f'display:block;text-align:center;text-decoration:none;' +
+        f'font-family:IBM Plex Mono,monospace;font-size:0.78rem;font-weight:700;' +
+        f'padding:0.45rem 0.3rem;border-radius:6px;' +
+        f'background:{bg};border:1px solid {bord};color:{txt};' +
+        f'-webkit-tap-highlight-color:transparent;'
+        f'">{label}{prob_txt}</a>'
     )
 chip_html += '</div>'
 st.markdown(chip_html, unsafe_allow_html=True)
