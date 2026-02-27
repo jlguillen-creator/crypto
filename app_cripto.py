@@ -316,15 +316,25 @@ with top_c3:
     top_analyze = st.button("⚡ ANALIZAR", key="top_btn",
                             use_container_width=True, type="primary")
 
-# Chips de selección rápida — 2 columnas (legibles en móvil)
-chip_selected = None
-chip_rows = [CRYPTOS[i:i+2] for i in range(0, len(CRYPTOS), 2)]
-for row in chip_rows:
-    cols = st.columns(2)
-    for j, (sym_k, label) in enumerate(row):
-        with cols[j]:
-            if st.button(label, key=f"chip_{sym_k}", use_container_width=True):
-                chip_selected = sym_k
+# ── Chips via query params — HTML grid puro, 2 col fijas en móvil ──
+qp = st.query_params
+chip_selected = qp.get("crypto", None)
+if chip_selected:
+    st.query_params.clear()
+
+chip_html = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:0.6rem;">'
+for sym_k, label in CRYPTOS:
+    chip_html += (
+        f'<a href="?crypto={sym_k}" target="_self" style="' +
+        'display:block;text-align:center;text-decoration:none;' +
+        'font-family:IBM Plex Mono,monospace;font-size:0.78rem;font-weight:700;' +
+        'padding:0.5rem 0.3rem;border-radius:6px;' +
+        'background:#141820;border:1px solid #2a3040;color:#c8d0e0;' +
+        '-webkit-tap-highlight-color:transparent;' +
+        f'">{label}</a>'
+    )
+chip_html += '</div>'
+st.markdown(chip_html, unsafe_allow_html=True)
 
 st.markdown("<hr style='border-color:#1e2432; margin:0.5rem 0 1rem;'>", unsafe_allow_html=True)
 
