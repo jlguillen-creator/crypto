@@ -1,913 +1,1246 @@
 """
-Crypto Predictor 5min — Streamlit App
-Fuente de datos: Kraken Public API (sin API key)
+Módulo de lógica central — Crypto Predictor 5min  v2.0
+═══════════════════════════════════════════════════════
+Fuentes de datos:
+  • Kraken REST API  — OHLCV 1m/5m/15m/1h, order book, ticker
+  • OKX REST API     — order book global, trades reales, funding rate,
+                       open interest, long/short ratio
+  • Alternative.me   — Fear & Greed Index (sentimiento macro)
+
+Mejoras v2:
+  • OKX como fuente de microestructura (10-20x más profundidad que Kraken)
+  • Buy/Sell ratio real de trades OKX (no estimado)
+  • Funding rate + OI + Long/Short de OKX perpetuos (real)
+  • Fear & Greed como modulador del score final
+  • Multi-timeframe: 15m y 1h como contexto de régimen
+  • Hurst Exponent → detecta tendencia vs. ruido vs. reversión
+  • Pesos dinámicos según régimen de mercado
+  • Correlación BTC (para altcoins)
+  • Filtro de wash-trading (volumen anómalo sin movimiento)
 """
 
-import streamlit as st
+import requests
 import pandas as pd
 import numpy as np
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
 import warnings
+import ssl
+import os
+import urllib3
 from datetime import datetime, timezone
-from crypto_predictor import (
-    descargar_datos, calcular_indicadores,
-    calcular_prediccion, BLOQUES_CRYPTO, PESOS_BASE,
-    normalizar_symbol
-)
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 warnings.filterwarnings("ignore")
-
-st.set_page_config(
-    page_title="Crypto Predictor 5m",
-    page_icon="⚡",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+ssl._create_default_https_context = ssl._create_unverified_context
+os.environ["PYTHONHTTPSVERIFY"] = "0"
 
 # ─────────────────────────────────────────────
-# CSS
+# ENDPOINTS
 # ─────────────────────────────────────────────
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600;700&family=DM+Sans:wght@400;500;600;700&display=swap');
+KRAKEN_BASE  = "https://api.kraken.com/0/public"
+OKX_BASE     = "https://www.okx.com/api/v5"
+FNG_URL      = "https://api.alternative.me/fng/?limit=3"
 
-html, body, [class*="css"] {
-    font-family: 'DM Sans', sans-serif;
-    background: #08090c;
-    color: #c8d0e0;
-    font-weight: 500;
-}
-body::after {
-    content: '';
-    position: fixed; top:0; left:0; width:100%; height:100%;
-    background: repeating-linear-gradient(0deg, transparent, transparent 2px,
-        rgba(255,180,0,0.008) 2px, rgba(255,180,0,0.008) 4px);
-    pointer-events: none; z-index: 9998;
-}
-
-/* ── Hero ── */
-.hero {
-    background: #0c0e15;
-    border: 1px solid #1e2432;
-    border-top: 2px solid var(--acc, #f5a623);
-    border-radius: 6px;
-    padding: 1.6rem 1.8rem;
-    margin-bottom: 1rem;
-    height: 100%;
-    box-sizing: border-box;
-}
-.hero-label {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 0.65rem; letter-spacing: 4px;
-    font-weight: 700; color: #8892a4;
-    text-transform: uppercase; margin-bottom: 0.3rem;
-}
-.hero-dir {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 3.6rem; font-weight: 700; line-height: 1;
-    color: var(--acc, #f5a623);
-    text-shadow: 0 0 40px var(--acc-glow, rgba(245,166,35,0.3));
-    letter-spacing: -2px;
-}
-.hero-badge {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 0.7rem; letter-spacing: 3px; font-weight: 700;
-    padding: 0.25rem 0.7rem;
-    border: 1px solid currentColor; border-radius: 2px;
-    display: inline-block; margin-top: 0.5rem;
-}
-.price-big {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 2.2rem; font-weight: 700; color: #e8edf5;
-}
-.price-chg {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 0.82rem; margin-top: 0.15rem; font-weight: 600;
-}
-.target-box {
-    background: #0a0c12; border: 1px solid #1e2432;
-    border-left: 2px solid var(--acc, #f5a623);
-    padding: 0.65rem 0.9rem; border-radius: 2px; margin-top: 0.6rem;
-}
-.target-price {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 1.5rem; font-weight: 700;
-}
-.target-sub {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 0.65rem; color: #8892a4;
-    font-weight: 600; margin-top: 0.2rem;
-}
-.score-big {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 3.2rem; font-weight: 700; line-height: 1;
-}
-.score-sub {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 0.58rem; color: #6b7894; margin-top: 0.15rem;
-}
-.counters {
-    display: flex; gap: 1.2rem; margin-top: 0.7rem;
-    font-family: 'IBM Plex Mono', monospace; font-size: 0.75rem; font-weight: 700;
-}
-
-/* ── Prob boxes ── */
-.pbox {
-    background: #0c0e15; border: 1px solid #1e2432;
-    border-radius: 6px; padding: 1rem 1.2rem;
-}
-.pbox-lbl {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 0.6rem; letter-spacing: 3px;
-    text-transform: uppercase; color: #8892a4;
-    font-weight: 700; margin-bottom: 0.4rem;
-}
-.pbox-val {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 2.2rem; font-weight: 700; line-height: 1;
-}
-.pbar-track {
-    background: #141820; height: 5px;
-    border-radius: 1px; margin-top: 0.5rem; overflow: hidden;
-}
-.pbar-fill { height: 100%; border-radius: 1px; }
-.pbox-sub {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 0.6rem; color: #8892a4;
-    font-weight: 600; margin-top: 0.35rem;
-}
-
-/* ── Info cards ── */
-.icard {
-    background: #0c0e15; border: 1px solid #1a1e2c;
-    border-radius: 6px; padding: 0.85rem 1rem;
-}
-.icard-lbl {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 0.56rem; letter-spacing: 3px;
-    text-transform: uppercase; color: #8892a4;
-    font-weight: 700; margin-bottom: 0.25rem;
-}
-.icard-val {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 1rem; font-weight: 700; color: #e8edf5;
-}
-
-/* ── Indicator table ── */
-.blk-title {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 0.6rem; letter-spacing: 3px; font-weight: 700;
-    color: #6b7894; text-transform: uppercase;
-    margin: 1.1rem 0 0.4rem;
-    border-bottom: 1px solid #141820; padding-bottom: 0.3rem;
-}
-.ind-row {
-    display: grid;
-    grid-template-columns: 7px 155px 1fr auto;
-    align-items: center; gap: 0.5rem;
-    padding: 0.4rem 0; border-bottom: 1px solid #0e1018;
-}
-.ind-dot  { width:7px; height:7px; border-radius:50%; flex-shrink:0; }
-.ind-name { font-family:'IBM Plex Mono',monospace; font-size:0.7rem; font-weight:600; color:#9aa0b4; }
-.ind-val  { font-family:'IBM Plex Mono',monospace; font-size:0.68rem; font-weight:500; color:#5a6480; }
-.ind-sig  { font-family:'DM Sans',sans-serif; font-size:0.72rem; font-weight:700; text-align:right; }
-
-/* ── Sidebar ── */
-section[data-testid="stSidebar"] {
-    background: #0a0b10;
-    border-right: 1px solid #1a1e2c;
-}
-section[data-testid="stSidebar"] p,
-section[data-testid="stSidebar"] span,
-section[data-testid="stSidebar"] label,
-section[data-testid="stSidebar"] div {
-    color: #c8d0e0 !important;
-    font-weight: 600 !important;
-}
-section[data-testid="stSidebar"] small,
-section[data-testid="stSidebar"] .st-emotion-cache-16txtl3 {
-    color: #8892a4 !important;
-}
-
-/* ── Top control bar ── */
-.ctrl-bar {
-    background: #0c0e15;
-    border: 1px solid #1e2432;
-    border-radius: 6px;
-    padding: 0.8rem 1.1rem;
-    margin-bottom: 0.8rem;
-    display: flex; align-items: center;
-    gap: 0.6rem; flex-wrap: wrap;
-}
-.ctrl-title {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 0.88rem; font-weight: 700;
-    color: #f5a623; letter-spacing: 2px;
-    white-space: nowrap;
-}
-
-/* ── Crypto chip buttons ── */
-.stButton > button {
-    font-family: 'IBM Plex Mono', monospace !important;
-    font-size: 0.68rem !important;
-    font-weight: 700 !important;
-    padding: 0.25rem 0.4rem !important;
-    border-radius: 20px !important;
-    border: 1px solid #2a3040 !important;
-    background: #141820 !important;
-    color: #c8d0e0 !important;
-    white-space: nowrap !important;
-}
-.stButton > button:hover {
-    border-color: #f5a623 !important;
-    color: #f5a623 !important;
-}
-
-/* ── Disclaimer ── */
-.disclaimer {
-    background: #0c0e15; border: 1px solid #1e2432;
-    border-left: 2px solid #f5a623;
-    padding: 0.6rem 1rem; font-size: 0.68rem;
-    color: #8892a4; font-family: 'IBM Plex Mono', monospace;
-    font-weight: 600; margin-top: 1.5rem; border-radius: 2px;
-}
-
-/* ── Mobile ── */
-@media (max-width: 768px) {
-    .hero { padding: 1rem 0.9rem; }
-    .hero-dir { font-size: 2.4rem; }
-    .price-big { font-size: 1.5rem; }
-    .score-big { font-size: 2.2rem; }
-    .pbox-val  { font-size: 1.8rem; }
-    .ind-row { grid-template-columns: 7px 1fr auto; }
-    .ind-val { display: none; }
-    .hero-label { font-size: 0.58rem; letter-spacing: 2px; }
-}
-</style>
-""", unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────
-# COLORES
+# CLIENTE HTTP
 # ─────────────────────────────────────────────
-C = {
-    "alcista":      "#00e87a",
-    "alcista_leve": "#4dd68c",
-    "bajista":      "#ff4f6a",
-    "bajista_leve": "#f5a623",
-    "neutro":       "#6b7894",
+def _get(url, params=None, timeout=10):
+    try:
+        r = requests.get(url, params=params, verify=False, timeout=timeout)
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, dict) and data.get("error") and data["error"]:
+                return None
+            return data
+        return None
+    except Exception:
+        return None
+
+
+# ─────────────────────────────────────────────
+# MAPAS DE SÍMBOLO
+# ─────────────────────────────────────────────
+_KRAKEN_ALIASES = {
+    "BTC":"XBTUSD",  "BTCUSDT":"XBTUSD",  "BTCUSD":"XBTUSD",
+    "ETH":"ETHUSD",  "ETHUSDT":"ETHUSD",
+    "SOL":"SOLUSD",  "SOLUSDT":"SOLUSD",
+    "BNB":"BNBUSD",  "BNBUSDT":"BNBUSD",
+    "XRP":"XRPUSD",  "XRPUSDT":"XRPUSD",
+    "ADA":"ADAUSD",  "ADAUSDT":"ADAUSD",
+    "DOGE":"XDGUSD", "DOGEUSDT":"XDGUSD",
+    "DOT":"DOTUSD",  "DOTUSDT":"DOTUSD",
+    "AVAX":"AVAXUSD","AVAXUSDT":"AVAXUSD",
+    "LINK":"LINKUSD","LINKUSDT":"LINKUSD",
+    "LTC":"XLTCZUSD","LTCUSDT":"XLTCZUSD",
+    "ATOM":"ATOMUSD","ATOMUSDT":"ATOMUSD",
+    "MATIC":"MATICUSD","MATICUSDT":"MATICUSD",
+    "UNI":"UNIUSD",  "UNIUSDT":"UNIUSD",
+    "NEAR":"NEARUSD","NEARUSDT":"NEARUSD",
+    "AAVE":"AAVEUSD","AAVEUSDT":"AAVEUSD",
+    "XLM":"XXLMZUSD","XLMUSDT":"XXLMZUSD",
+    "TRX":"TRXUSD",  "TRXUSDT":"TRXUSD",
 }
-GLOW = {
-    "alcista":      "rgba(0,232,122,0.3)",
-    "alcista_leve": "rgba(77,214,140,0.2)",
-    "bajista":      "rgba(255,79,106,0.3)",
-    "bajista_leve": "rgba(245,166,35,0.2)",
-    "neutro":       "rgba(107,120,148,0.1)",
+
+# OKX usa el formato "BTC-USDT" para spot y "BTC-USDT-SWAP" para perpetuos
+_OKX_SPOT = {
+    "BTC":"BTC-USDT",  "ETH":"ETH-USDT",  "SOL":"SOL-USDT",
+    "XRP":"XRP-USDT",  "BNB":"BNB-USDT",  "ADA":"ADA-USDT",
+    "DOGE":"DOGE-USDT","DOT":"DOT-USDT",  "AVAX":"AVAX-USDT",
+    "LINK":"LINK-USDT","LTC":"LTC-USDT",  "ATOM":"ATOM-USDT",
+    "MATIC":"MATIC-USDT","UNI":"UNI-USDT","NEAR":"NEAR-USDT",
+    "AAVE":"AAVE-USDT","XLM":"XLM-USDT", "TRX":"TRX-USDT",
+}
+_OKX_SWAP = {k: v.replace("-USDT", "-USDT-SWAP") for k, v in _OKX_SPOT.items()}
+
+# BTC en Kraken = "XBTUSD", pero para OKX = "BTC"
+_KRAKEN_TO_BASE = {
+    "XBTUSD":"BTC", "ETHUSD":"ETH", "SOLUSD":"SOL", "XRPUSD":"XRP",
+    "BNBUSD":"BNB", "ADAUSD":"ADA", "XDGUSD":"DOGE", "DOTUSD":"DOT",
+    "AVAXUSD":"AVAX","LINKUSD":"LINK","XLTCZUSD":"LTC","ATOMUSD":"ATOM",
+    "MATICUSD":"MATIC","UNIUSD":"UNI","NEARUSD":"NEAR","AAVEUSD":"AAVE",
+    "XXLMZUSD":"XLM","TRXUSD":"TRX",
 }
 
-CRYPTOS = [
-    ("BTC","₿ BTC"), ("ETH","Ξ ETH"),   ("SOL","◎ SOL"),  ("XRP","✕ XRP"),
-    ("BNB","⬡ BNB"), ("DOGE","Ð DOGE"), ("ADA","₳ ADA"),  ("AVAX","▲ AVAX"),
-    ("DOT","● DOT"), ("LINK","⬡ LINK"),  ("LTC","Ł LTC"),  ("ATOM","⚛ ATOM"),
-]
+
+def normalizar_symbol(symbol: str) -> tuple:
+    """Devuelve (kraken_pair, display_name)."""
+    s = symbol.upper().strip().replace("/","").replace("-","").replace("_","")
+    if s in _KRAKEN_ALIASES:
+        pair    = _KRAKEN_ALIASES[s]
+        base    = _KRAKEN_TO_BASE.get(pair, s.replace("USDT","").replace("USD",""))
+        display = base + "/USD"
+        return pair, display
+    if s.endswith("USD"):
+        return s, s[:-3] + "/USD"
+    if s.endswith("USDT"):
+        return s[:-1], s[:-4] + "/USD"
+    return s + "USD", s + "/USD"
+
+
+def _base_from_kraken(kraken_pair: str) -> str:
+    """XBTUSD → BTC, ETHUSD → ETH, …"""
+    return _KRAKEN_TO_BASE.get(kraken_pair, kraken_pair.replace("USD",""))
+
 
 # ─────────────────────────────────────────────
-# SIDEBAR (colapsado por defecto, útil en desktop)
+# FUNCIONES DE DESCARGA INDIVIDUALES
 # ─────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("**⚡ CRYPTO PREDICTOR**")
-    st.markdown("**5-MINUTE SIGNAL**")
-    st.caption("Kraken API · sin registro · 20 indicadores")
-    st.divider()
 
-    sb_symbol = st.text_input(
-        "Par de trading", value="BTC",
-        placeholder="BTC, ETH, SOL…",
-        key="sb_input"
-    ).strip()
-    auto_refresh = st.checkbox("Auto-refresh cada 60s", value=False)
-    sb_analyze = st.button("⚡ ANALIZAR", use_container_width=True,
-                           type="primary", key="sb_btn")
-    st.divider()
-    st.markdown("**TOP 12**")
-    sb_c1, sb_c2 = st.columns(2)
-    sb_selected = None
-    for i, (sym_k, label) in enumerate(CRYPTOS):
-        col = sb_c1 if i % 2 == 0 else sb_c2
-        if col.button(label, key=f"sb_{sym_k}", use_container_width=True):
-            sb_selected = sym_k
-    st.divider()
-    st.caption("FUENTE · Kraken REST API\nVELAS · 1m + 5m\nORDER BOOK · Top 20")
+def _kraken_ohlc(pair: str, interval: int, limit: int = 100):
+    """Descarga velas de Kraken. Devuelve DataFrame o None."""
+    raw = _get(f"{KRAKEN_BASE}/OHLC", {"pair": pair, "interval": interval})
+    if not raw or "result" not in raw:
+        return None
+    key = [k for k in raw["result"] if k != "last"][0]
+    data = raw["result"][key][-(limit + 1):-1]
+    if len(data) < 10:
+        return None
+    df = pd.DataFrame(data, columns=["time","open","high","low","close","vwap","volume","count"])
+    df["time"] = pd.to_datetime(df["time"], unit="s")
+    df = df.set_index("time")
+    for col in ["open","high","low","close","vwap","volume"]:
+        df[col] = df[col].astype(float)
+    df["count"] = df["count"].astype(int)
+    return df
 
-# ─────────────────────────────────────────────
-# BARRA DE CONTROL SUPERIOR (mobile-first)
-# ─────────────────────────────────────────────
-top_c1, top_c2, top_c3 = st.columns([2, 4, 2])
-with top_c1:
-    st.markdown('<div class="ctrl-title">⚡ 5-MIN</div>', unsafe_allow_html=True)
-with top_c2:
-    top_symbol = st.text_input(
-        "Par", value="BTC", label_visibility="collapsed",
-        placeholder="BTC, ETH, SOL, XRP…", key="top_input"
-    ).strip()
-with top_c3:
-    top_analyze = st.button("⚡ ANALIZAR", key="top_btn",
-                            use_container_width=True, type="primary")
 
-# Chips de selección rápida — 2 columnas (legibles en móvil)
-chip_selected = None
-chip_rows = [CRYPTOS[i:i+2] for i in range(0, len(CRYPTOS), 2)]
-for row in chip_rows:
-    cols = st.columns(2)
-    for j, (sym_k, label) in enumerate(row):
-        with cols[j]:
-            if st.button(label, key=f"chip_{sym_k}", use_container_width=True):
-                chip_selected = sym_k
+def _kraken_book(pair: str):
+    raw = _get(f"{KRAKEN_BASE}/Depth", {"pair": pair, "count": 20})
+    if raw and "result" in raw:
+        key = list(raw["result"].keys())[0]
+        bk  = raw["result"][key]
+        return {
+            "bids": [[float(b[0]), float(b[1])] for b in bk.get("bids", [])],
+            "asks": [[float(a[0]), float(a[1])] for a in bk.get("asks", [])],
+            "source": "kraken",
+        }
+    return None
 
-st.markdown("<hr style='border-color:#1e2432; margin:0.5rem 0 1rem;'>", unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────
-# RESOLVER SÍMBOLO Y TRIGGER
-# ─────────────────────────────────────────────
-if chip_selected:
-    symbol_final = chip_selected
-    do_analyze   = True
-elif sb_selected:
-    symbol_final = sb_selected
-    do_analyze   = True
-elif top_analyze or sb_analyze or auto_refresh:
-    symbol_final = top_symbol if top_symbol else sb_symbol
-    do_analyze   = True
-else:
-    symbol_final = ""
-    do_analyze   = False
+def _okx_book(base: str):
+    """Order book de OKX spot — profundidad 20 niveles."""
+    inst = _OKX_SPOT.get(base)
+    if not inst:
+        return None
+    raw = _get(f"{OKX_BASE}/market/books", {"instId": inst, "sz": "20"})
+    if raw and raw.get("code") == "0" and raw.get("data"):
+        bk = raw["data"][0]
+        return {
+            "bids": [[float(b[0]), float(b[1])] for b in bk.get("bids", [])],
+            "asks": [[float(a[0]), float(a[1])] for a in bk.get("asks", [])],
+            "source": "okx",
+        }
+    return None
 
-# ─────────────────────────────────────────────
-# AUTO-REFRESH
-# ─────────────────────────────────────────────
-if auto_refresh:
-    st.markdown("""<script>setTimeout(()=>window.location.reload(),60000);</script>""",
-                unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────
-# PANTALLA INICIAL
-# ─────────────────────────────────────────────
-if not do_analyze:
-    st.markdown("""
-    <div style="text-align:center; padding:3rem 2rem;">
-        <div style="font-family:'IBM Plex Mono',monospace; font-size:3rem;
-                    font-weight:700; color:#f5a623;
-                    text-shadow:0 0 60px rgba(245,166,35,0.3); margin-bottom:0.4rem;">
-            ⚡ 5-MIN SIGNAL
-        </div>
-        <div style="font-family:'IBM Plex Mono',monospace; font-size:0.75rem;
-                    color:#3a4055; letter-spacing:3px; font-weight:700; margin-bottom:2rem;">
-            CRYPTO PREDICTOR · KRAKEN API
-        </div>
-        <div style="display:flex; gap:0.8rem; justify-content:center; flex-wrap:wrap;">
-            <span style="background:#0c0e15; border:1px solid #1e2432; border-radius:4px;
-                         padding:0.5rem 0.9rem; font-family:'IBM Plex Mono',monospace;
-                         font-size:0.62rem; color:#8892a4; font-weight:700; letter-spacing:2px;">
-                📡 KRAKEN REAL-TIME
-            </span>
-            <span style="background:#0c0e15; border:1px solid #1e2432; border-radius:4px;
-                         padding:0.5rem 0.9rem; font-family:'IBM Plex Mono',monospace;
-                         font-size:0.62rem; color:#8892a4; font-weight:700; letter-spacing:2px;">
-                🔑 SIN API KEY
-            </span>
-            <span style="background:#0c0e15; border:1px solid #1e2432; border-radius:4px;
-                         padding:0.5rem 0.9rem; font-family:'IBM Plex Mono',monospace;
-                         font-size:0.62rem; color:#8892a4; font-weight:700; letter-spacing:2px;">
-                📊 20 INDICADORES
-            </span>
-        </div>
-        <div style="font-family:'IBM Plex Mono',monospace; font-size:0.6rem;
-                    color:#2a3040; letter-spacing:3px; font-weight:700; margin-top:1.5rem;">
-            PULSA UNA CRIPTO ARRIBA ↑
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-    st.stop()
+def _okx_trades(base: str):
+    """Últimos 100 trades de OKX — permite calcular taker buy/sell real."""
+    inst = _OKX_SPOT.get(base)
+    if not inst:
+        return None
+    raw = _get(f"{OKX_BASE}/market/trades", {"instId": inst, "limit": "100"})
+    if raw and raw.get("code") == "0" and raw.get("data"):
+        trades = raw["data"]
+        buy_vol  = sum(float(t["sz"]) * float(t["px"])
+                       for t in trades if t.get("side") == "buy")
+        sell_vol = sum(float(t["sz"]) * float(t["px"])
+                       for t in trades if t.get("side") == "sell")
+        total    = buy_vol + sell_vol
+        return {
+            "buy_vol":   buy_vol,
+            "sell_vol":  sell_vol,
+            "buy_ratio": buy_vol / total * 100 if total > 0 else 50.0,
+            "n_trades":  len(trades),
+        }
+    return None
 
-# ─────────────────────────────────────────────
-# ANÁLISIS
-# ─────────────────────────────────────────────
-kraken_pair, sym_display = normalizar_symbol(symbol_final)
 
-with st.spinner(f"Conectando con Kraken · {sym_display} · OKX · F&G…"):
-    df, df5, book, futures_data, info, error, df15, df1h = descargar_datos(symbol_final)
+def _okx_funding(base: str):
+    """Funding rate actual del perpetuo en OKX."""
+    inst = _OKX_SWAP.get(base)
+    if not inst:
+        return None
+    raw = _get(f"{OKX_BASE}/public/funding-rate", {"instId": inst})
+    if raw and raw.get("code") == "0" and raw.get("data"):
+        fr = raw["data"][0].get("fundingRate")
+        next_fr = raw["data"][0].get("nextFundingRate")
+        return {
+            "funding_rate":      float(fr) if fr else None,
+            "next_funding_rate": float(next_fr) if next_fr else None,
+        }
+    return None
 
-if error or df is None:
-    st.error(f"❌ {error}")
-    st.stop()
 
-with st.spinner("Calculando 20 indicadores…"):
-    indicadores, señales, puntuaciones, atr_pct, regimen, hurst_val = calcular_indicadores(
-        df, df5, book, futures_data, info, df15, df1h)
-    pred = calcular_prediccion(puntuaciones, info["precio_actual"], indicadores,
-                              regimen=regimen, fng_data=futures_data)
+def _okx_open_interest(base: str):
+    """Open Interest del perpetuo en OKX."""
+    inst = _OKX_SWAP.get(base)
+    if not inst:
+        return None
+    raw = _get(f"{OKX_BASE}/public/open-interest", {"instId": inst})
+    if raw and raw.get("code") == "0" and raw.get("data"):
+        oi = raw["data"][0].get("oiCcy")  # en moneda base
+        return float(oi) if oi else None
+    return None
 
-# ── Pre-calcular TODAS las variables antes de cualquier f-string HTML ──
-precio         = info["precio_actual"]
-cambio_pct     = info["cambio_pct"]
-sc             = pred["señal_color"]
-acento         = C[sc]
-glow           = GLOW[sc]
-ts             = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
 
-direccion      = pred["direccion"]
-señal_texto    = pred["señal_texto"]
-precio_obj     = pred["precio_objetivo"]
-mov_est        = pred["mov_estimado"]
-atr_disp       = pred["atr_pct"]
-score          = pred["score"]
-prob_up        = pred["prob_subida"]
-prob_dn        = pred["prob_bajada"]
-n_alc          = pred["alcistas"]
-n_neu          = pred["neutros"]
-n_baj          = pred["bajistas"]
+def _okx_oi_history(base: str):
+    """Historial de OI (8 puntos cada 5min) para calcular cambio %."""
+    inst = _OKX_SWAP.get(base)
+    if not inst:
+        return None
+    raw = _get(f"{OKX_BASE}/rubik/stat/contracts/open-interest-volume",
+               {"ccy": base, "period": "5m"})
+    # Endpoint alternativo si falla
+    if not raw or raw.get("code") != "0":
+        raw = _get(f"{OKX_BASE}/public/open-interest-history",
+                   {"instId": inst, "period": "5m", "limit": "8"})
+    if raw and raw.get("code") == "0" and raw.get("data") and len(raw["data"]) >= 2:
+        try:
+            vals = [float(d[1]) if isinstance(d, list) else float(d.get("oiCcy", 0))
+                    for d in raw["data"][:8]]
+            if vals[0] > 0 and vals[-1] > 0:
+                return (vals[0] - vals[-1]) / vals[-1] * 100
+        except Exception:
+            pass
+    return None
 
-flecha_precio  = "&#9650;" if cambio_pct >= 0 else "&#9660;"
-color_cambio   = "#00e87a" if cambio_pct >= 0 else "#ff4f6a"
-flecha_score   = "&#8593;" if score > 0 else "&#8595;"
 
-precio_fmt     = f"${precio:,.4f}"
-precio_obj_fmt = f"${precio_obj:,.4f}"
-cambio_fmt     = f"{cambio_pct:+.2f}%"
-score_fmt      = f"{score:+.3f}"
-mov_fmt        = f"{mov_est:.4f}%"
-atr_fmt        = f"{atr_disp:.3f}%"
-rng_lo_fmt     = f"${precio * (1 - mov_est / 100):,.4f}"
-rng_hi_fmt     = f"${precio * (1 + mov_est / 100):,.4f}"
-acento80       = acento + "80"
+def _okx_long_short(base: str):
+    """Ratio long/short de OKX."""
+    raw = _get(f"{OKX_BASE}/rubik/stat/contracts/long-short-account-ratio",
+               {"ccy": base, "period": "5m"})
+    if raw and raw.get("code") == "0" and raw.get("data"):
+        try:
+            ls_ratio = float(raw["data"][0][1])  # longRatio
+            return {
+                "long_ratio":  ls_ratio / (1 + ls_ratio),
+                "short_ratio": 1 / (1 + ls_ratio),
+                "ls_raw":      ls_ratio,
+            }
+        except Exception:
+            pass
+    return None
 
-# ─────────────────────────────────────────────
-# ══ HERO ══
-# ─────────────────────────────────────────────
-st.markdown(f'<style>.hero{{--acc:{acento};--acc-glow:{glow};}}.target-box{{--acc:{acento};}}</style>',
-            unsafe_allow_html=True)
 
-# ══════════════════════════════════════════════
-# FILA 1 — PREDICCIÓN (lo más importante, primero)
-# Dirección grande + Prob subida + Prob bajada + Rango
-# ══════════════════════════════════════════════
-c_up = "#00e87a" if prob_up > 55 else ("#ff4f6a" if prob_up < 45 else "#f5a623")
-c_dn = "#ff4f6a" if prob_dn > 55 else ("#00e87a" if prob_dn < 45 else "#f5a623")
+def _fear_greed():
+    """Fear & Greed Index de alternative.me — actualiza cada hora."""
+    raw = _get(FNG_URL, timeout=6)
+    if raw and "data" in raw and raw["data"]:
+        try:
+            latest = raw["data"][0]
+            prev   = raw["data"][1] if len(raw["data"]) > 1 else latest
+            return {
+                "value":          int(latest["value"]),
+                "classification": latest["value_classification"],
+                "prev_value":     int(prev["value"]),
+                "trend":          int(latest["value"]) - int(prev["value"]),
+            }
+        except Exception:
+            pass
+    return None
 
-p1, p2, p3, p4 = st.columns([3, 2, 2, 2])
 
-with p1:
-    # Caja de dirección — texto más grande, es el resultado final
-    st.markdown(
-        '<div class="hero" style="height:100%;">'
-        f'<div class="hero-label">&#9889; {sym_display} &middot; PREDICCI&Oacute;N +5 MINUTOS &middot; {ts}</div>'
-        f'<div class="hero-dir" style="font-size:4.5rem;">{direccion}</div>'
-        f'<div><span class="hero-badge" style="color:{acento}; border-color:{acento80}; font-size:0.82rem; padding:0.35rem 1rem;">'
-        f'{señal_texto}</span></div>'
-        '</div>',
-        unsafe_allow_html=True
-    )
+def _okx_price(base: str):
+    """Precio último de OKX para comparación multi-exchange."""
+    inst = _OKX_SPOT.get(base)
+    if not inst:
+        return None
+    raw = _get(f"{OKX_BASE}/market/ticker", {"instId": inst})
+    if raw and raw.get("code") == "0" and raw.get("data"):
+        try:
+            return float(raw["data"][0]["last"])
+        except Exception:
+            pass
+    return None
 
-with p2:
-    st.markdown(
-        '<div class="pbox" style="height:100%; box-sizing:border-box;">'
-        '<div class="pbox-lbl" style="font-size:0.68rem; letter-spacing:3px;">PROB SUBIDA</div>'
-        f'<div class="pbox-val" style="color:{c_up}; font-size:3rem;">{prob_up:.1f}%</div>'
-        '<div class="pbar-track" style="height:7px; margin-top:0.7rem;">'
-        f'<div class="pbar-fill" style="width:{prob_up}%; background:{c_up}; box-shadow:0 0 10px {c_up}60;"></div>'
-        '</div>'
-        '<div class="pbox-sub" style="font-size:0.68rem; margin-top:0.5rem;">pr&oacute;ximos 5 min</div>'
-        '</div>',
-        unsafe_allow_html=True
-    )
-
-with p3:
-    st.markdown(
-        '<div class="pbox" style="height:100%; box-sizing:border-box;">'
-        '<div class="pbox-lbl" style="font-size:0.68rem; letter-spacing:3px;">PROB BAJADA</div>'
-        f'<div class="pbox-val" style="color:{c_dn}; font-size:3rem;">{prob_dn:.1f}%</div>'
-        '<div class="pbar-track" style="height:7px; margin-top:0.7rem;">'
-        f'<div class="pbar-fill" style="width:{prob_dn}%; background:{c_dn}; box-shadow:0 0 10px {c_dn}60;"></div>'
-        '</div>'
-        '<div class="pbox-sub" style="font-size:0.68rem; margin-top:0.5rem;">pr&oacute;ximos 5 min</div>'
-        '</div>',
-        unsafe_allow_html=True
-    )
-
-with p4:
-    st.markdown(
-        '<div class="pbox" style="height:100%; box-sizing:border-box;">'
-        '<div class="pbox-lbl" style="font-size:0.68rem; letter-spacing:3px;">RANGO ESTIMADO</div>'
-        f'<div class="pbox-val" style="color:{acento}; font-size:2.4rem;">&plusmn;{mov_fmt}</div>'
-        '<div style="margin-top:0.6rem; font-family:\'IBM Plex Mono\',monospace; font-weight:700; line-height:2.0;">'
-        f'<div style="font-size:0.82rem; color:#00e87a;">&#9650; {rng_hi_fmt}</div>'
-        f'<div style="font-size:0.82rem; color:#ff4f6a;">&#9660; {rng_lo_fmt}</div>'
-        '</div>'
-        '</div>',
-        unsafe_allow_html=True
-    )
-
-st.markdown("<div style='margin:0.7rem 0;'></div>", unsafe_allow_html=True)
-
-# ══════════════════════════════════════════════
-# FILA 2 — PRECIO ACTUAL + SCORE + OBJETIVO
-# ══════════════════════════════════════════════
-h2, h3 = st.columns([3, 2])
-
-with h2:
-    st.markdown(
-        '<div class="hero">'
-        '<div class="hero-label">PRECIO ACTUAL</div>'
-        f'<div class="price-big">{precio_fmt}</div>'
-        f'<div class="price-chg" style="color:{color_cambio};">'
-        f'{flecha_precio} {cambio_fmt} (24h)</div>'
-        '<div class="target-box">'
-        '<div class="hero-label">PRECIO OBJETIVO +5m</div>'
-        f'<div class="target-price" style="color:{acento};">{precio_obj_fmt}</div>'
-        f'<div class="target-sub">{flecha_score} {mov_fmt} estimado &middot; ATR {atr_fmt}</div>'
-        '</div>'
-        '</div>',
-        unsafe_allow_html=True
-    )
-
-with h3:
-    st.markdown(
-        '<div class="hero">'
-        '<div class="hero-label">SCORE COMPUESTO</div>'
-        f'<div class="score-big" style="color:{acento}; text-shadow:0 0 30px {glow};">'
-        f'{score_fmt}</div>'
-        '<div class="score-sub">escala &minus;1 a +1</div>'
-        '<div class="counters">'
-        f'<span style="color:#00e87a;">&#9650; {n_alc}</span>'
-        f'<span style="color:#6b7894;">&#9711; {n_neu}</span>'
-        f'<span style="color:#ff4f6a;">&#9660; {n_baj}</span>'
-        '</div>'
-        '</div>',
-        unsafe_allow_html=True
-    )
-
-st.markdown("<div style='margin:0.7rem 0;'></div>", unsafe_allow_html=True)
-
-# ── Info de mercado ──
-vol_fmt  = f"${info['vol_24h']/1e6:.1f}M" if info["vol_24h"] > 1e6 else f"${info['vol_24h']:,.0f}"
-fr_val   = futures_data.get("funding_rate")
-fr_fmt   = f"{fr_val*100:+.4f}%" if fr_val is not None else "N/A"
-fr_color = "#ff4f6a" if fr_val and fr_val > 0 else ("#00e87a" if fr_val and fr_val < 0 else "#8892a4")
-oi_val   = futures_data.get("open_interest")
-oi_fmt   = f"{oi_val:,.0f}" if oi_val else "N/A"
-hl_fmt   = f"${info['high_24h']:,.4f} / ${info['low_24h']:,.4f}"
-
-mc1, mc2, mc3, mc4 = st.columns(4)
-with mc1:
-    st.markdown(f'<div class="icard"><div class="icard-lbl">VOL 24H</div><div class="icard-val">{vol_fmt}</div></div>',
-                unsafe_allow_html=True)
-with mc2:
-    st.markdown(f'<div class="icard"><div class="icard-lbl">HIGH / LOW 24H</div><div class="icard-val" style="font-size:0.82rem;">{hl_fmt}</div></div>',
-                unsafe_allow_html=True)
-with mc3:
-    st.markdown(f'<div class="icard"><div class="icard-lbl">FUNDING RATE</div><div class="icard-val" style="color:{fr_color};">{fr_fmt}</div></div>',
-                unsafe_allow_html=True)
-with mc4:
-    st.markdown(f'<div class="icard"><div class="icard-lbl">OPEN INTEREST</div><div class="icard-val">{oi_fmt}</div></div>',
-                unsafe_allow_html=True)
-
-st.markdown("<div style='margin:0.7rem 0;'></div>", unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────
-# PANEL DE RÉGIMEN Y MODULADORES
+# HURST EXPONENT (detección de régimen)
 # ─────────────────────────────────────────────
-REGIME_LABELS = {
-    "trending":       ("TENDENCIA",   "#4e9eff", "Indicadores de momentum amplificados"),
-    "mean_reverting": ("REVERSIÓN",   "#f5a623", "Osciladores amplificados"),
-    "noise":          ("RUIDO/LATERAL","#6b7894","Microestructura amplificada"),
-}
-reg_label, reg_color, reg_desc = REGIME_LABELS.get(
-    regimen, ("?", "#6b7894", "")
-)
-hurst_fmt    = f"{hurst_val:.3f}"
-fng_val_disp = futures_data.get("fng_value")
-fng_cls_disp = futures_data.get("fng_class", "N/A")
-fng_color    = ("#00e87a" if fng_val_disp and fng_val_disp <= 40 else
-                "#ff4f6a" if fng_val_disp and fng_val_disp >= 60 else "#f5a623")
-fng_disp     = f"{fng_val_disp} — {fng_cls_disp}" if fng_val_disp else "N/A"
+def hurst_exponent(series: pd.Series, min_lag: int = 2, max_lag: int = 20) -> float:
+    """
+    H > 0.6  → tendencia persistente (trending)
+    H ≈ 0.5  → movimiento browniano (ruido, difícil predecir)
+    H < 0.4  → reversión a la media (mean-reverting)
+    """
+    try:
+        prices = series.dropna().values
+        if len(prices) < max_lag * 2:
+            return 0.5
+        lags   = range(min_lag, max_lag)
+        tau    = [np.std(np.subtract(prices[lag:], prices[:-lag])) for lag in lags]
+        tau    = [t for t in tau if t > 0]
+        if len(tau) < 3:
+            return 0.5
+        poly   = np.polyfit(np.log(list(range(min_lag, min_lag + len(tau)))),
+                            np.log(tau), 1)
+        return max(0.1, min(0.9, poly[0]))
+    except Exception:
+        return 0.5
 
-book_src_disp  = futures_data.get("book_source", "kraken").upper()
-tf_align_disp  = pred.get("tf_align", 0)
-fng_mod_disp   = pred.get("fng_mod", 1.0)
-tf_mod_disp    = pred.get("tf_mod", 1.0)
-regime_mod_disp= pred.get("regime_mod", 1.0)
-score_raw_disp = pred.get("score_raw", score)
 
-st.markdown(
-    '<div style="background:#0a0c12; border:1px solid #1e2432; border-left:3px solid #4e9eff;'
-    'border-radius:6px; padding:0.9rem 1.2rem; margin-bottom:0.7rem;">'
-    '<div style="font-family:\'IBM Plex Mono\',monospace; font-size:0.58rem; letter-spacing:3px;'
-    'font-weight:700; color:#8892a4; margin-bottom:0.6rem;">ANÁLISIS DE RÉGIMEN Y MODULADORES</div>'
-    '<div style="display:flex; flex-wrap:wrap; gap:1.5rem; align-items:flex-start;">',
-    unsafe_allow_html=True
-)
-
-rm1, rm2, rm3, rm4, rm5 = st.columns(5)
-
-with rm1:
-    st.markdown(
-        f'<div class="icard"><div class="icard-lbl">RÉGIMEN (HURST={hurst_fmt})</div>'
-        f'<div class="icard-val" style="color:{reg_color}; font-size:0.85rem;">{reg_label}</div>'
-        f'<div style="font-family:\'IBM Plex Mono\',monospace; font-size:0.58rem; color:#6b7894; margin-top:0.2rem;">{reg_desc}</div></div>',
-        unsafe_allow_html=True
-    )
-with rm2:
-    st.markdown(
-        f'<div class="icard"><div class="icard-lbl">FEAR &amp; GREED</div>'
-        f'<div class="icard-val" style="color:{fng_color};">{fng_disp}</div>'
-        f'<div style="font-family:\'IBM Plex Mono\',monospace; font-size:0.58rem; color:#6b7894; margin-top:0.2rem;">Mod F&G: ×{fng_mod_disp:.3f}</div></div>',
-        unsafe_allow_html=True
-    )
-with rm3:
-    tf_color = "#00e87a" if tf_align_disp == 2 else ("#f5a623" if tf_align_disp == 1 else "#6b7894")
-    tf_txt   = ["Sin alineación", "15m confirma", "15m + 1h confirman"][tf_align_disp]
-    st.markdown(
-        f'<div class="icard"><div class="icard-lbl">ALINEACIÓN MULTI-TF</div>'
-        f'<div class="icard-val" style="color:{tf_color}; font-size:0.85rem;">{tf_txt}</div>'
-        f'<div style="font-family:\'IBM Plex Mono\',monospace; font-size:0.58rem; color:#6b7894; margin-top:0.2rem;">Mod TF: ×{tf_mod_disp:.3f}</div></div>',
-        unsafe_allow_html=True
-    )
-with rm4:
-    st.markdown(
-        f'<div class="icard"><div class="icard-lbl">ORDER BOOK FUENTE</div>'
-        f'<div class="icard-val" style="color:#4e9eff; font-size:0.85rem;">{book_src_disp}</div>'
-        f'<div style="font-family:\'IBM Plex Mono\',monospace; font-size:0.58rem; color:#6b7894; margin-top:0.2rem;">Mod régimen: ×{regime_mod_disp:.3f}</div></div>',
-        unsafe_allow_html=True
-    )
-with rm5:
-    raw_color = "#00e87a" if score_raw_disp > 0 else ("#ff4f6a" if score_raw_disp < 0 else "#6b7894")
-    st.markdown(
-        f'<div class="icard"><div class="icard-lbl">SCORE BRUTO → FINAL</div>'
-        f'<div class="icard-val" style="color:{raw_color};">{score_raw_disp:+.3f} → {score_fmt}</div>'
-        f'<div style="font-family:\'IBM Plex Mono\',monospace; font-size:0.58rem; color:#6b7894; margin-top:0.2rem;">Ajuste total: ×{fng_mod_disp*tf_mod_disp*regime_mod_disp:.3f}</div></div>',
-        unsafe_allow_html=True
-    )
-
-st.markdown("<div style='margin:0.7rem 0;'></div>", unsafe_allow_html=True)
-
-# ─────────────────────────────────────────────
-# TABS
-# ─────────────────────────────────────────────
-tab_charts, tab_indicators, tab_book = st.tabs(["📈 Gráficos", "📋 Indicadores", "📖 Order Book"])
-
-# ─────────────────────────────────────────────
-# GRÁFICOS
-# ─────────────────────────────────────────────
-with tab_charts:
-    BG   = "#08090c"
-    PAN  = "#0c0e15"
-    GRID = "#141820"
-    CLR  = {"a":"#00e87a","b":"#ff4f6a","p":"#f5a623","blue":"#4e9eff","purple":"#a29bfe"}
-
-    close_  = df["close"]
-    high_   = df["high"]
-    low_    = df["low"]
-    vol_    = df["volume"]
-
-    fig = plt.figure(figsize=(18, 16), facecolor=BG)
-    gs  = gridspec.GridSpec(4, 3, figure=fig, hspace=0.48, wspace=0.3)
-
-    def style_ax(ax, title=""):
-        ax.set_facecolor(PAN)
-        ax.tick_params(colors="#4a5568", labelsize=7.5)
-        for sp in ax.spines.values():
-            sp.set_color(GRID)
-        ax.grid(color=GRID, linewidth=0.5, alpha=0.6)
-        if title:
-            ax.set_title(title, color="#6b7894", fontsize=9,
-                         fontfamily="monospace", pad=5, fontweight="bold")
-
-    # 1. Precio + EMA + BB
-    ax1 = fig.add_subplot(gs[0, :])
-    c80 = close_.tail(80); e7 = close_.ewm(span=7).mean().tail(80)
-    e25 = close_.ewm(span=25).mean().tail(80)
-    bm  = close_.rolling(20).mean().tail(80); bs = close_.rolling(20).std().tail(80)
-    ax1.fill_between(range(80), (bm+2*bs).values, (bm-2*bs).values, alpha=0.06, color=CLR["p"])
-    ax1.plot(range(80), (bm+2*bs).values, color=CLR["p"], lw=0.5, alpha=0.4)
-    ax1.plot(range(80), (bm-2*bs).values, color=CLR["p"], lw=0.5, alpha=0.4)
-    ax1.plot(range(80), c80.values,  color=CLR["blue"],   lw=1.8, zorder=5, label="Precio")
-    ax1.plot(range(80), e7.values,   color=CLR["a"],      lw=1.2, alpha=0.9, label="EMA7")
-    ax1.plot(range(80), e25.values,  color=CLR["purple"], lw=1.2, alpha=0.9, label="EMA25")
-    ax1.axhline(precio, color="yellow", lw=0.8, ls="--", alpha=0.4)
-    ax1.legend(loc="upper left", facecolor=PAN, labelcolor="#8892a4",
-               fontsize=7.5, framealpha=0.9, edgecolor=GRID)
-    style_ax(ax1, f"PRECIO 1M — {sym_display}  |  EMA7 · EMA25 · BOLLINGER (20)")
-
-    # 2. Volumen
-    ax2 = fig.add_subplot(gs[1, :2])
-    v50 = vol_.tail(50); va = vol_.rolling(20).mean().tail(50)
-    taker = df["taker_buy_base"].tail(50)
-    vcols = [CLR["a"] if tb >= v*0.5 else CLR["b"] for tb, v in zip(taker.values, v50.values)]
-    ax2.bar(range(len(v50)), v50.values, color=vcols, alpha=0.8, width=0.85)
-    ax2.plot(range(len(va)), va.values, color="white", lw=1.2, alpha=0.5, label="MA20")
-    ax2.set_xticks([]); ax2.legend(facecolor=PAN, labelcolor="#8892a4", fontsize=7.5, edgecolor=GRID)
-    style_ax(ax2, "VOLUMEN  (verde=buy / rojo=sell)")
-
-    # 3. Buy/Sell ratio
-    ax3 = fig.add_subplot(gs[1, 2])
-    tbq = df["taker_buy_quote"].tail(30)
-    tsq = (df["quote_volume"] - df["taker_buy_quote"]).tail(30)
-    ratio = tbq / (tbq + tsq) * 100
-    rc = [CLR["a"] if v > 50 else CLR["b"] for v in ratio.values]
-    ax3.bar(range(len(ratio)), ratio.values - 50, color=rc, alpha=0.8, width=0.85)
-    ax3.axhline(0, color="#3a4055", lw=0.8); ax3.set_xticks([])
-    ax3.set_ylabel("Buy% − 50", color="#6b7894", fontsize=7)
-    style_ax(ax3, "BUY/SELL RATIO")
-
-    # 4. RSI
-    ax4 = fig.add_subplot(gs[2, 0])
-    dlt  = close_.diff()
-    rsi_s = (100 - 100 / (1 + dlt.clip(lower=0).rolling(9).mean() /
-                           (-dlt.clip(upper=0)).rolling(9).mean())).tail(60)
-    ax4.plot(range(len(rsi_s)), rsi_s.values, color=CLR["blue"], lw=1.5)
-    ax4.axhline(70, color=CLR["b"], ls="--", lw=0.8, alpha=0.6)
-    ax4.axhline(30, color=CLR["a"], ls="--", lw=0.8, alpha=0.6)
-    ax4.fill_between(range(len(rsi_s)), rsi_s.values, 70, where=rsi_s.values>70, alpha=0.12, color=CLR["b"])
-    ax4.fill_between(range(len(rsi_s)), rsi_s.values, 30, where=rsi_s.values<30, alpha=0.12, color=CLR["a"])
-    ax4.set_ylim(0, 100); ax4.set_xticks([])
-    style_ax(ax4, "RSI (9)")
-
-    # 5. MACD
-    ax5 = fig.add_subplot(gs[2, 1])
-    ml = (close_.ewm(span=5).mean() - close_.ewm(span=13).mean()).tail(60)
-    sl = ml.ewm(span=3).mean(); hl2 = ml - sl
-    hc = [CLR["a"] if v >= 0 else CLR["b"] for v in hl2.values]
-    ax5.bar(range(len(hl2)), hl2.values, color=hc, alpha=0.8, width=0.85)
-    ax5.plot(range(len(ml)), ml.values, color=CLR["p"],      lw=1.4, label="MACD")
-    ax5.plot(range(len(sl)), sl.values, color=CLR["purple"], lw=1.4, label="Signal")
-    ax5.axhline(0, color="#3a4055", lw=0.5); ax5.set_xticks([])
-    ax5.legend(facecolor=PAN, labelcolor="#8892a4", fontsize=7, edgecolor=GRID)
-    style_ax(ax5, "MACD (5,13,3)")
-
-    # 6. Stochastic
-    ax6 = fig.add_subplot(gs[2, 2])
-    l5 = low_.rolling(5).min(); h5 = high_.rolling(5).max()
-    sk = ((close_ - l5) / (h5 - l5) * 100).rolling(3).mean().tail(60)
-    sd = sk.rolling(3).mean()
-    ax6.plot(range(len(sk)), sk.values, color=CLR["a"], lw=1.4, label="%K")
-    ax6.plot(range(len(sd)), sd.values, color=CLR["b"], lw=1.4, label="%D")
-    ax6.axhline(80, color=CLR["b"], ls="--", lw=0.7, alpha=0.5)
-    ax6.axhline(20, color=CLR["a"], ls="--", lw=0.7, alpha=0.5)
-    ax6.set_ylim(0, 100); ax6.set_xticks([])
-    ax6.legend(facecolor=PAN, labelcolor="#8892a4", fontsize=7, edgecolor=GRID)
-    style_ax(ax6, "STOCHASTIC (5,3)")
-
-    # 7. Gauge
-    ax7 = fig.add_subplot(gs[3, 0])
-    ax7.set_facecolor(PAN); ax7.set_aspect("equal")
-    theta = np.linspace(np.pi, 0, 300)
-    ax7.plot(np.cos(theta), np.sin(theta), color="#141820", lw=22, solid_capstyle="round")
-    end_a  = np.pi - (prob_up / 100) * np.pi
-    theta2 = np.linspace(np.pi, end_a, 300)
-    gc = CLR["a"] if prob_up > 55 else (CLR["b"] if prob_up < 45 else CLR["p"])
-    ax7.plot(np.cos(theta2), np.sin(theta2), color=gc, lw=22, solid_capstyle="round")
-    ax7.text(0, 0.2, f"{prob_up:.1f}%", ha="center", va="center",
-             fontsize=26, fontweight="bold", color=gc, fontfamily="monospace")
-    ax7.text(0, -0.05, "PROB SUBIDA", ha="center", va="center",
-             fontsize=7.5, color="#8892a4", fontfamily="monospace")
-    ax7.text(-1.05, -0.18, "0%",   color="#3a4055", fontsize=7, fontfamily="monospace")
-    ax7.text(0.75,  -0.18, "100%", color="#3a4055", fontsize=7, fontfamily="monospace")
-    ax7.set_xlim(-1.3, 1.3); ax7.set_ylim(-0.3, 1.2); ax7.axis("off")
-    ax7.set_title(f"SEÑAL: {direccion}", color="#6b7894",
-                  fontsize=9, fontfamily="monospace", pad=5, fontweight="bold")
-    for sp in ax7.spines.values(): sp.set_color(GRID)
-
-    # 8. Scores
-    ax8 = fig.add_subplot(gs[3, 1:])
-    inds_s = sorted(puntuaciones.items(), key=lambda x: x[1])
-    names  = [i[0][:24] for i in inds_s]
-    vals   = [i[1] for i in inds_s]
-    bc     = [CLR["a"] if v > 0 else (CLR["b"] if v < 0 else "#2a3040") for v in vals]
-    ax8.barh(range(len(names)), vals, color=bc, alpha=0.85, height=0.65)
-    ax8.set_yticks(range(len(names)))
-    ax8.set_yticklabels(names, fontsize=7, color="#8892a4", fontfamily="monospace")
-    ax8.axvline(0, color="#2a3040", lw=0.8); ax8.set_xlim(-1.2, 1.2)
-    ax8.set_xlabel("← BAJISTA  ·  ALCISTA →", color="#4a5568", fontsize=7.5, fontfamily="monospace")
-    style_ax(ax8, "SCORE POR INDICADOR")
-
-    plt.suptitle(f"{sym_display}  ·  ANÁLISIS 5MIN  ·  {ts}",
-                 color="#4a5568", fontsize=9, fontfamily="monospace", y=1.01, fontweight="bold")
-    st.pyplot(fig, use_container_width=True)
-    plt.close()
-
-# ─────────────────────────────────────────────
-# INDICADORES
-# ─────────────────────────────────────────────
-with tab_indicators:
-    for bloque, inds_list in BLOQUES_CRYPTO.items():
-        st.markdown(f'<div class="blk-title">{bloque}</div>', unsafe_allow_html=True)
-        col_a, col_b = st.columns(2)
-        for i, ind in enumerate(inds_list):
-            val     = str(indicadores.get(ind, "N/A"))
-            senal   = señales.get(ind, ("neutro", "N/A"))
-            tipo, texto = senal if isinstance(senal, tuple) else ("neutro", str(senal))
-            score_i = puntuaciones.get(ind, 0)
-            dc      = C.get(tipo, C["neutro"])
-            glow_i  = f"0 0 5px {dc}" if score_i != 0 else "none"
-            col     = col_a if i % 2 == 0 else col_b
-            # Pre-calcular estilos
-            dot_sty = f"background:{dc}; box-shadow:{glow_i};"
-            with col:
-                st.markdown(
-                    f'<div class="ind-row">'
-                    f'<div class="ind-dot" style="{dot_sty}"></div>'
-                    f'<div class="ind-name">{ind}</div>'
-                    f'<div class="ind-val">{val}</div>'
-                    f'<div class="ind-sig" style="color:{dc};">{texto}</div>'
-                    f'</div>',
-                    unsafe_allow_html=True
-                )
-    st.markdown("<div style='margin-bottom:1rem;'></div>", unsafe_allow_html=True)
-
-# ─────────────────────────────────────────────
-# ORDER BOOK
-# ─────────────────────────────────────────────
-with tab_book:
-    if book and book.get("bids") and book.get("asks"):
-        bids_raw = [(float(b[0]), float(b[1])) for b in book["bids"][:15]]
-        asks_raw = [(float(a[0]), float(a[1])) for a in book["asks"][:15]]
-
-        bid_total = sum(b[1] for b in bids_raw)
-        ask_total = sum(a[1] for a in asks_raw)
-        obi       = (bid_total - ask_total) / (bid_total + ask_total) * 100
-
-        # Pre-calcular todo
-        base_name     = info["nombre"].split("/")[0]
-        spread_val    = asks_raw[0][0] - bids_raw[0][0]
-        spread_fmt    = f"{spread_val:+.4f}"
-        obi_color     = "#00e87a" if obi > 0 else "#ff4f6a"
-        obi_fmt       = f"{obi:+.1f}%"
-        bid_tot_fmt   = f"{bid_total:.4f}"
-        ask_tot_fmt   = f"{ask_total:.4f}"
-
-        cb, cm, ca = st.columns([5, 2, 5])
-
-        with cb:
-            st.markdown(
-                f'<div class="blk-title" style="color:#00e87a;">BIDS (COMPRAS) &mdash; {bid_tot_fmt} {base_name}</div>',
-                unsafe_allow_html=True
-            )
-            max_bv = max(b[1] for b in bids_raw)
-            for price_b, vol_b in bids_raw:
-                bw = vol_b / max_bv * 100
-                pb = f"${price_b:,.4f}"; vb = f"{vol_b:.4f}"
-                st.markdown(
-                    f'<div style="display:flex;align-items:center;gap:0.5rem;padding:0.18rem 0;font-family:\'IBM Plex Mono\',monospace;">'
-                    f'<div style="background:#00e87a18;border-radius:2px;width:{bw:.0f}%;min-width:4px;height:14px;border-right:2px solid #00e87a;"></div>'
-                    f'<div style="font-size:0.7rem;font-weight:700;color:#00e87a;min-width:95px;">{pb}</div>'
-                    f'<div style="font-size:0.65rem;font-weight:600;color:#8892a4;">{vb}</div>'
-                    f'</div>',
-                    unsafe_allow_html=True
-                )
-
-        with cm:
-            st.markdown(
-                f'<div style="text-align:center;padding:1rem 0.4rem;">'
-                f'<div class="icard-lbl">SPREAD</div>'
-                f'<div style="font-family:\'IBM Plex Mono\',monospace;font-size:0.85rem;font-weight:700;color:#f5a623;margin-bottom:1rem;">{spread_fmt}</div>'
-                f'<div class="icard-lbl">OBI</div>'
-                f'<div style="font-family:\'IBM Plex Mono\',monospace;font-size:1.2rem;font-weight:700;color:{obi_color};">{obi_fmt}</div>'
-                f'<div style="font-family:\'IBM Plex Mono\',monospace;font-size:0.58rem;font-weight:700;color:#8892a4;margin-top:0.3rem;">Order Book<br>Imbalance</div>'
-                f'</div>',
-                unsafe_allow_html=True
-            )
-
-        with ca:
-            st.markdown(
-                f'<div class="blk-title" style="color:#ff4f6a;text-align:right;">ASKS (VENTAS) &mdash; {ask_tot_fmt} {base_name}</div>',
-                unsafe_allow_html=True
-            )
-            max_av = max(a[1] for a in asks_raw)
-            for price_a, vol_a in asks_raw:
-                aw = vol_a / max_av * 100
-                pa = f"${price_a:,.4f}"; va = f"{vol_a:.4f}"
-                st.markdown(
-                    f'<div style="display:flex;align-items:center;justify-content:flex-end;gap:0.5rem;padding:0.18rem 0;font-family:\'IBM Plex Mono\',monospace;">'
-                    f'<div style="font-size:0.65rem;font-weight:600;color:#8892a4;">{va}</div>'
-                    f'<div style="font-size:0.7rem;font-weight:700;color:#ff4f6a;min-width:95px;text-align:right;">{pa}</div>'
-                    f'<div style="background:#ff4f6a18;border-radius:2px;width:{aw:.0f}%;min-width:4px;height:14px;border-left:2px solid #ff4f6a;"></div>'
-                    f'</div>',
-                    unsafe_allow_html=True
-                )
+def clasificar_regimen(h: float) -> str:
+    if h > 0.62:
+        return "trending"
+    elif h < 0.40:
+        return "mean_reverting"
     else:
-        st.info("Order book no disponible para este par.")
+        return "noise"
+
 
 # ─────────────────────────────────────────────
-# DISCLAIMER
+# DETECCIÓN DE WASH TRADING
 # ─────────────────────────────────────────────
-st.markdown(
-    '<div class="disclaimer">'
-    '&#9888; AVISO LEGAL: An&aacute;lisis educativo e informativo. '
-    'Las criptomonedas son activos de alto riesgo. '
-    'Las predicciones a 5 minutos tienen fiabilidad limitada por naturaleza. '
-    'No constituye asesoramiento financiero.'
-    '</div>',
-    unsafe_allow_html=True
-)
+def detectar_wash_trading(df: pd.DataFrame) -> float:
+    """
+    Devuelve ratio de velas sospechosas (vol alto + movimiento mínimo).
+    > 0.4 → posible wash trading, reducir confianza en volumen.
+    """
+    try:
+        vol_z    = (df["volume"] - df["volume"].mean()) / df["volume"].std()
+        body_pct = ((df["close"] - df["open"]).abs() / df["close"] * 100)
+        sospecha = ((vol_z > 2.0) & (body_pct < 0.02)).sum()
+        return sospecha / len(df)
+    except Exception:
+        return 0.0
+
+
+# ─────────────────────────────────────────────
+# DESCARGA PRINCIPAL — PARALELA
+# ─────────────────────────────────────────────
+def descargar_datos(symbol: str):
+    pair, display = normalizar_symbol(symbol)
+    base = _base_from_kraken(pair)
+
+    # ── Test conectividad Kraken ──
+    ping = _get(f"{KRAKEN_BASE}/Time")
+    if ping is None:
+        return None, None, None, None, None, (
+            "No se puede conectar con Kraken API. Comprueba tu conexión."
+        )
+
+    # ── Descarga en paralelo de todas las fuentes ──
+    results = {}
+    def fetch(key, fn, *args):
+        results[key] = fn(*args)
+
+    tasks = {
+        "ohlc_1m":   (_kraken_ohlc, pair, 1, 100),
+        "ohlc_5m":   (_kraken_ohlc, pair, 5, 60),
+        "ohlc_15m":  (_kraken_ohlc, pair, 15, 50),
+        "ohlc_1h":   (_kraken_ohlc, pair, 60, 48),
+        "book_krk":  (_kraken_book, pair),
+        "book_okx":  (_okx_book, base),
+        "trades_okx":(_okx_trades, base),
+        "funding":   (_okx_funding, base),
+        "oi":        (_okx_open_interest, base),
+        "oi_hist":   (_okx_oi_history, base),
+        "ls_ratio":  (_okx_long_short, base),
+        "fng":       (_fear_greed,),
+        "okx_price": (_okx_price, base),
+    }
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futs = {ex.submit(fn, *args): key for key, (fn, *args) in tasks.items()}
+        for fut in as_completed(futs):
+            key = futs[fut]
+            try:
+                results[key] = fut.result()
+            except Exception:
+                results[key] = None
+
+    # ── Validar OHLC 1m (obligatorio) ──
+    df = results.get("ohlc_1m")
+    if df is None:
+        assets = _get(f"{KRAKEN_BASE}/AssetPairs", {"pair": pair})
+        if assets and "result" in assets:
+            alt = list(assets["result"].keys())[0]
+            df  = _kraken_ohlc(alt, 1, 100)
+    if df is None or len(df) < 20:
+        return None, None, None, None, None, (
+            f"Par '{pair}' no encontrado en Kraken. "
+            "Prueba con: BTC, ETH, SOL, XRP, DOGE, ADA, DOT, AVAX, LINK, LTC…"
+        )
+
+    # ── Enriquecer df con taker estimado (mejorado con OKX trades si disponible) ──
+    okx_trades = results.get("trades_okx")
+    if okx_trades:
+        # Usar ratio real de OKX para distribuir el volumen de las últimas velas
+        real_ratio = okx_trades["buy_ratio"] / 100
+        df["taker_buy_base"]  = df["volume"] * real_ratio
+        df["quote_volume"]    = df["volume"] * df["close"]
+        df["taker_buy_quote"] = df["quote_volume"] * real_ratio
+    else:
+        df["quote_volume"]    = df["volume"] * df["close"]
+        df["taker_buy_quote"] = df.apply(
+            lambda r: r["quote_volume"] * 0.6 if r["close"] >= r["open"]
+                      else r["quote_volume"] * 0.4, axis=1)
+        df["taker_buy_base"]  = df.apply(
+            lambda r: r["volume"] * 0.6 if r["close"] >= r["open"]
+                      else r["volume"] * 0.4, axis=1)
+    df["trades"] = df["count"]
+
+    # ── Order book: preferir OKX (más profundo), fallback Kraken ──
+    book_okx = results.get("book_okx")
+    book_krk = results.get("book_krk")
+    book = book_okx if book_okx else book_krk
+
+    # ── Ticker Kraken para precio y 24h stats ──
+    ticker_raw    = _get(f"{KRAKEN_BASE}/Ticker", {"pair": pair})
+    precio_actual = float(df["close"].iloc[-1])
+    cambio_pct    = 0.0
+    vol_24h = high_24h = low_24h = 0.0
+
+    if ticker_raw and "result" in ticker_raw:
+        tk_key = list(ticker_raw["result"].keys())[0]
+        tk     = ticker_raw["result"][tk_key]
+        precio_actual = float(tk["c"][0])
+        open_price    = float(tk["o"])
+        cambio_pct    = (precio_actual / open_price - 1) * 100 if open_price else 0
+        vol_24h       = float(tk["v"][1]) * precio_actual
+        high_24h      = float(tk["h"][1])
+        low_24h       = float(tk["l"][1])
+
+    # ── Precio OKX para comparación multi-exchange ──
+    okx_price     = results.get("okx_price")
+    price_diverge = None
+    if okx_price and precio_actual > 0:
+        price_diverge = (precio_actual - okx_price) / okx_price * 100
+
+    # ── Datos de futuros / derivados de OKX ──
+    funding_data  = results.get("funding") or {}
+    oi_val        = results.get("oi")
+    oi_chg        = results.get("oi_hist")
+    ls_data       = results.get("ls_ratio") or {}
+
+    futures_data = {
+        "funding_rate":      funding_data.get("funding_rate"),
+        "next_funding_rate": funding_data.get("next_funding_rate"),
+        "open_interest":     oi_val,
+        "oi_change_pct":     oi_chg,
+        "long_ratio":        ls_data.get("long_ratio"),
+        "short_ratio":       ls_data.get("short_ratio"),
+        "ls_raw":            ls_data.get("ls_raw"),
+        "okx_trades":        okx_trades,
+        "price_diverge":     price_diverge,
+        "book_source":       book.get("source", "kraken") if book else "kraken",
+    }
+
+    # ── Fear & Greed ──
+    fng = results.get("fng")
+    if fng:
+        futures_data["fng_value"]  = fng["value"]
+        futures_data["fng_class"]  = fng["classification"]
+        futures_data["fng_trend"]  = fng["trend"]
+
+    info = {
+        "symbol":        pair,
+        "nombre":        display,
+        "precio_actual": precio_actual,
+        "precio_prev":   float(df["close"].iloc[-2]),
+        "cambio_pct":    cambio_pct,
+        "vol_24h":       vol_24h,
+        "high_24h":      high_24h,
+        "low_24h":       low_24h,
+        "okx_price":     okx_price,
+        "base":          base,
+    }
+
+    return df, results.get("ohlc_5m"), book, futures_data, info, None, \
+           results.get("ohlc_15m"), results.get("ohlc_1h")
+
+
+# ─────────────────────────────────────────────
+# 20 INDICADORES BASE + NUEVOS CONTEXTUALES
+# ─────────────────────────────────────────────
+
+def calcular_indicadores(df, df5, book, futures_data, info,
+                         df15=None, df1h=None):
+    indicadores  = {}
+    señales      = {}
+    puntuaciones = {}
+
+    close   = df["close"]
+    high    = df["high"]
+    low     = df["low"]
+    volume  = df["volume"]
+    precio  = info["precio_actual"]
+
+    # ── 1. RSI (9) ──
+    delta  = close.diff()
+    avg_g  = delta.clip(lower=0).rolling(9).mean()
+    avg_l  = (-delta.clip(upper=0)).rolling(9).mean()
+    rsi    = (100 - 100 / (1 + avg_g / avg_l)).iloc[-1]
+    indicadores["RSI (9)"] = round(rsi, 1)
+    if rsi < 30:
+        señales["RSI (9)"] = ("alcista", f"Sobreventa ({rsi:.1f})")
+        puntuaciones["RSI (9)"] = 1.0
+    elif rsi > 70:
+        señales["RSI (9)"] = ("bajista", f"Sobrecompra ({rsi:.1f})")
+        puntuaciones["RSI (9)"] = -1.0
+    elif rsi < 45:
+        señales["RSI (9)"] = ("alcista_leve", f"Zona baja ({rsi:.1f})")
+        puntuaciones["RSI (9)"] = 0.4
+    elif rsi > 55:
+        señales["RSI (9)"] = ("bajista_leve", f"Zona alta ({rsi:.1f})")
+        puntuaciones["RSI (9)"] = -0.4
+    else:
+        señales["RSI (9)"] = ("neutro", f"Neutro ({rsi:.1f})")
+        puntuaciones["RSI (9)"] = 0.0
+
+    # ── 2. MACD (5,13,3) ──
+    macd_l  = close.ewm(span=5).mean() - close.ewm(span=13).mean()
+    sig_l   = macd_l.ewm(span=3).mean()
+    hist    = macd_l - sig_l
+    h_val, h_prev = hist.iloc[-1], hist.iloc[-2]
+    indicadores["MACD (5,13,3)"] = f"{macd_l.iloc[-1]:.4f} / {sig_l.iloc[-1]:.4f}"
+    if h_val > 0 and h_val > h_prev:
+        señales["MACD (5,13,3)"] = ("alcista", "Histograma subiendo")
+        puntuaciones["MACD (5,13,3)"] = 1.0
+    elif h_val > 0 and h_val <= h_prev:
+        señales["MACD (5,13,3)"] = ("alcista_leve", "MACD+ perdiendo fuerza")
+        puntuaciones["MACD (5,13,3)"] = 0.3
+    elif h_val < 0 and h_val < h_prev:
+        señales["MACD (5,13,3)"] = ("bajista", "Histograma bajando")
+        puntuaciones["MACD (5,13,3)"] = -1.0
+    elif h_val < 0 and h_val >= h_prev:
+        señales["MACD (5,13,3)"] = ("bajista_leve", "MACD- perdiendo fuerza")
+        puntuaciones["MACD (5,13,3)"] = -0.3
+    else:
+        señales["MACD (5,13,3)"] = ("neutro", "Cruce zona 0")
+        puntuaciones["MACD (5,13,3)"] = 0.0
+
+    # ── 3. EMA 7/25 ──
+    ema7  = close.ewm(span=7).mean().iloc[-1]
+    ema25 = close.ewm(span=25).mean().iloc[-1]
+    indicadores["EMA 7/25"] = f"{ema7:.4f} / {ema25:.4f}"
+    if ema7 > ema25 and precio > ema7:
+        señales["EMA 7/25"] = ("alcista", "Precio > EMA7 > EMA25")
+        puntuaciones["EMA 7/25"] = 1.0
+    elif ema7 > ema25:
+        señales["EMA 7/25"] = ("alcista_leve", "EMA7 > EMA25, retroceso")
+        puntuaciones["EMA 7/25"] = 0.3
+    elif ema7 < ema25 and precio < ema7:
+        señales["EMA 7/25"] = ("bajista", "Precio < EMA7 < EMA25")
+        puntuaciones["EMA 7/25"] = -1.0
+    elif ema7 < ema25:
+        señales["EMA 7/25"] = ("bajista_leve", "EMA7 < EMA25, rebote")
+        puntuaciones["EMA 7/25"] = -0.3
+    else:
+        señales["EMA 7/25"] = ("neutro", "EMAs entrelazadas")
+        puntuaciones["EMA 7/25"] = 0.0
+
+    # ── 4. Bollinger %B ──
+    bb_mid   = close.rolling(20).mean()
+    bb_std   = close.rolling(20).std()
+    bb_upper = (bb_mid + 2 * bb_std).iloc[-1]
+    bb_lower = (bb_mid - 2 * bb_std).iloc[-1]
+    bb_mid_v = bb_mid.iloc[-1]
+    pct_b    = (precio - bb_lower) / (bb_upper - bb_lower) * 100 \
+               if (bb_upper - bb_lower) > 0 else 50
+    bw       = (bb_upper - bb_lower) / bb_mid_v * 100
+    indicadores["Bollinger %B"] = f"{pct_b:.1f}% (BW {bw:.2f}%)"
+    if pct_b < 5:
+        señales["Bollinger %B"] = ("alcista", f"Banda inferior ({pct_b:.0f}%)")
+        puntuaciones["Bollinger %B"] = 1.0
+    elif pct_b > 95:
+        señales["Bollinger %B"] = ("bajista", f"Banda superior ({pct_b:.0f}%)")
+        puntuaciones["Bollinger %B"] = -1.0
+    elif pct_b < 35:
+        señales["Bollinger %B"] = ("alcista_leve", f"Zona baja ({pct_b:.0f}%)")
+        puntuaciones["Bollinger %B"] = 0.4
+    elif pct_b > 65:
+        señales["Bollinger %B"] = ("bajista_leve", f"Zona alta ({pct_b:.0f}%)")
+        puntuaciones["Bollinger %B"] = -0.4
+    else:
+        señales["Bollinger %B"] = ("neutro", f"Centro ({pct_b:.0f}%)")
+        puntuaciones["Bollinger %B"] = 0.0
+
+    # ── 5. Stochastic (5,3) ──
+    low5  = low.rolling(5).min()
+    high5 = high.rolling(5).max()
+    stoch_k = ((close - low5) / (high5 - low5) * 100).rolling(3).mean()
+    stoch_d = stoch_k.rolling(3).mean()
+    k, d = stoch_k.iloc[-1], stoch_d.iloc[-1]
+    indicadores["Stochastic (5,3)"] = f"K={k:.1f} D={d:.1f}"
+    if k < 20 and d < 20:
+        señales["Stochastic (5,3)"] = ("alcista", f"Sobreventa K={k:.0f}")
+        puntuaciones["Stochastic (5,3)"] = 1.0
+    elif k > 80 and d > 80:
+        señales["Stochastic (5,3)"] = ("bajista", f"Sobrecompra K={k:.0f}")
+        puntuaciones["Stochastic (5,3)"] = -1.0
+    elif k > d and k < 50:
+        señales["Stochastic (5,3)"] = ("alcista_leve", "K cruza D desde abajo")
+        puntuaciones["Stochastic (5,3)"] = 0.5
+    elif k < d and k > 50:
+        señales["Stochastic (5,3)"] = ("bajista_leve", "K cruza D desde arriba")
+        puntuaciones["Stochastic (5,3)"] = -0.5
+    else:
+        señales["Stochastic (5,3)"] = ("neutro", f"Zona media K={k:.0f}")
+        puntuaciones["Stochastic (5,3)"] = 0.0
+
+    # ── 6. Williams %R ──
+    hh = high.rolling(14).max()
+    ll = low.rolling(14).min()
+    wr = ((hh - close) / (hh - ll) * -100).iloc[-1]
+    indicadores["Williams %R"] = f"{wr:.1f}"
+    if wr < -80:
+        señales["Williams %R"] = ("alcista", f"Sobreventa ({wr:.0f})")
+        puntuaciones["Williams %R"] = 1.0
+    elif wr > -20:
+        señales["Williams %R"] = ("bajista", f"Sobrecompra ({wr:.0f})")
+        puntuaciones["Williams %R"] = -1.0
+    else:
+        señales["Williams %R"] = ("neutro", f"Zona media ({wr:.0f})")
+        puntuaciones["Williams %R"] = 0.0
+
+    # ── 7. ATR (9) — informativo ──
+    tr    = pd.concat([high - low,
+                       (high - close.shift()).abs(),
+                       (low  - close.shift()).abs()], axis=1).max(axis=1)
+    atr   = tr.rolling(9).mean().iloc[-1]
+    atr_pct = atr / precio * 100
+    indicadores["ATR (9)"] = f"±{atr:.4f} (±{atr_pct:.3f}%)"
+    señales["ATR (9)"]     = ("neutro", f"Volatilidad: ±{atr_pct:.3f}% por vela")
+    puntuaciones["ATR (9)"] = 0.0
+
+    # ── 8. Rate of Change ──
+    roc5 = (close.iloc[-1] / close.iloc[-6] - 1) * 100 if len(close) >= 6 else 0
+    roc3 = (close.iloc[-1] / close.iloc[-4] - 1) * 100 if len(close) >= 4 else 0
+    indicadores["Rate of Change"] = f"3m: {roc3:+.3f}% | 5m: {roc5:+.3f}%"
+    if roc5 > 0.15 and roc3 > 0:
+        señales["Rate of Change"] = ("alcista", f"Momentum +{roc5:.3f}%")
+        puntuaciones["Rate of Change"] = min(1.0, roc5 / 0.3)
+    elif roc5 < -0.15 and roc3 < 0:
+        señales["Rate of Change"] = ("bajista", f"Momentum {roc5:.3f}%")
+        puntuaciones["Rate of Change"] = max(-1.0, roc5 / 0.3)
+    else:
+        señales["Rate of Change"] = ("neutro", f"Sin momentum ({roc5:+.3f}%)")
+        puntuaciones["Rate of Change"] = 0.0
+
+    # ── 9. OBV ──
+    obv        = (np.sign(close.diff()) * volume).fillna(0).cumsum()
+    obv_ema    = obv.ewm(span=10).mean()
+    obv_trend  = obv.iloc[-1] - obv.iloc[-5]
+    indicadores["OBV"] = f"Δ5m: {obv_trend:+.0f}"
+    if obv.iloc[-1] > obv_ema.iloc[-1] and obv_trend > 0:
+        señales["OBV"] = ("alcista", "OBV > EMA y subiendo")
+        puntuaciones["OBV"] = 1.0
+    elif obv.iloc[-1] < obv_ema.iloc[-1] and obv_trend < 0:
+        señales["OBV"] = ("bajista", "OBV < EMA y bajando")
+        puntuaciones["OBV"] = -1.0
+    else:
+        señales["OBV"] = ("neutro", "OBV mixto")
+        puntuaciones["OBV"] = 0.0
+
+    # ── 10. VWAP Desviación ──
+    vwap = (close * volume).cumsum() / volume.cumsum()
+    vwap_dev = (precio - vwap.iloc[-1]) / vwap.iloc[-1] * 100
+    indicadores["VWAP Desviación"] = f"VWAP={vwap.iloc[-1]:.4f} ({vwap_dev:+.3f}%)"
+    if vwap_dev > 0.1:
+        señales["VWAP Desviación"] = ("bajista_leve", f"Precio {vwap_dev:+.2f}% sobre VWAP")
+        puntuaciones["VWAP Desviación"] = -0.5
+    elif vwap_dev < -0.1:
+        señales["VWAP Desviación"] = ("alcista_leve", f"Precio {vwap_dev:+.2f}% bajo VWAP")
+        puntuaciones["VWAP Desviación"] = 0.5
+    else:
+        señales["VWAP Desviación"] = ("neutro", f"≈ VWAP ({vwap_dev:+.3f}%)")
+        puntuaciones["VWAP Desviación"] = 0.0
+
+    # ── 11. Volumen Relativo ──
+    vol_ma    = volume.rolling(20).mean().iloc[-1]
+    vol_ratio = volume.iloc[-1] / vol_ma if vol_ma > 0 else 1
+    cambio_1m = (close.iloc[-1] - close.iloc[-2]) / close.iloc[-2] * 100
+    # Penalizar si hay indicio de wash trading
+    wash_ratio = detectar_wash_trading(df)
+    vol_ratio_adj = vol_ratio * (1 - wash_ratio * 0.5)
+    indicadores["Volumen Relativo"] = f"{vol_ratio_adj:.2f}x" + (" ⚠wash" if wash_ratio > 0.3 else "")
+    if vol_ratio_adj > 2.0 and cambio_1m > 0:
+        señales["Volumen Relativo"] = ("alcista", f"Vol {vol_ratio_adj:.1f}x alcista")
+        puntuaciones["Volumen Relativo"] = 1.0
+    elif vol_ratio_adj > 2.0 and cambio_1m < 0:
+        señales["Volumen Relativo"] = ("bajista", f"Vol {vol_ratio_adj:.1f}x bajista")
+        puntuaciones["Volumen Relativo"] = -1.0
+    elif vol_ratio_adj > 1.3 and cambio_1m > 0:
+        señales["Volumen Relativo"] = ("alcista_leve", f"Vol elevado ({vol_ratio_adj:.1f}x)")
+        puntuaciones["Volumen Relativo"] = 0.5
+    elif vol_ratio_adj > 1.3 and cambio_1m < 0:
+        señales["Volumen Relativo"] = ("bajista_leve", f"Vol elevado bajista ({vol_ratio_adj:.1f}x)")
+        puntuaciones["Volumen Relativo"] = -0.5
+    else:
+        señales["Volumen Relativo"] = ("neutro", f"Normal ({vol_ratio_adj:.1f}x)")
+        puntuaciones["Volumen Relativo"] = 0.0
+
+    # ── 12. Patrón Vela ──
+    o, c_, h_, l_ = df["open"].iloc[-1], close.iloc[-1], high.iloc[-1], low.iloc[-1]
+    body  = abs(c_ - o); rng = h_ - l_
+    ls_s  = min(o, c_) - l_; us_s = h_ - max(o, c_)
+    patron, p_score = "Neutro", 0.0
+    if rng > 0:
+        if body > rng * 0.8 and c_ > o:
+            patron, p_score = "Marubozu alcista", 1.0
+        elif body > rng * 0.8 and c_ < o:
+            patron, p_score = "Marubozu bajista", -1.0
+        elif ls_s > body * 2 and us_s < body * 0.5:
+            patron, p_score = "Hammer", 1.0
+        elif us_s > body * 2 and ls_s < body * 0.5:
+            patron, p_score = "Shooting Star", -1.0
+        elif body < rng * 0.1:
+            patron, p_score = "Doji", 0.0
+        elif c_ > o:
+            patron, p_score = "Alcista", 0.5
+        else:
+            patron, p_score = "Bajista", -0.5
+    indicadores["Patrón Vela 1m"] = patron
+    tipo_v = ("alcista" if p_score > 0.5 else
+              "bajista" if p_score < -0.5 else
+              "alcista_leve" if p_score > 0 else
+              "bajista_leve" if p_score < 0 else "neutro")
+    señales["Patrón Vela 1m"] = (tipo_v, patron)
+    puntuaciones["Patrón Vela 1m"] = p_score
+
+    # ── 13. Order Book Imbalance (OKX preferido) ──
+    book_src = futures_data.get("book_source", "kraken")
+    if book and "bids" in book and "asks" in book:
+        bids    = book["bids"][:10]
+        asks    = book["asks"][:10]
+        bid_vol = sum(float(b[1]) for b in bids)
+        ask_vol = sum(float(a[1]) for a in asks)
+        total   = bid_vol + ask_vol
+        obi     = (bid_vol - ask_vol) / total * 100 if total > 0 else 0
+        src_tag = "OKX" if book_src == "okx" else "Kraken"
+        indicadores["Order Book Imbalance"] = f"OBI={obi:+.1f}% [{src_tag}]"
+        if obi > 15:
+            señales["Order Book Imbalance"] = ("alcista", f"Presión compradora {obi:+.0f}% [{src_tag}]")
+            puntuaciones["Order Book Imbalance"] = min(1.0, obi / 30)
+        elif obi < -15:
+            señales["Order Book Imbalance"] = ("bajista", f"Presión vendedora {obi:+.0f}% [{src_tag}]")
+            puntuaciones["Order Book Imbalance"] = max(-1.0, obi / 30)
+        else:
+            señales["Order Book Imbalance"] = ("neutro", f"Equilibrado {obi:+.0f}% [{src_tag}]")
+            puntuaciones["Order Book Imbalance"] = obi / 100
+    else:
+        indicadores["Order Book Imbalance"] = "N/A"
+        señales["Order Book Imbalance"] = ("neutro", "Sin datos")
+        puntuaciones["Order Book Imbalance"] = 0.0
+
+    # ── 14. Bid/Ask Spread ──
+    if book and book.get("bids") and book.get("asks"):
+        best_bid = float(book["bids"][0][0])
+        best_ask = float(book["asks"][0][0])
+        spread   = (best_ask - best_bid) / best_bid * 100
+        indicadores["Bid/Ask Spread"] = f"{spread:.4f}%"
+        if spread < 0.01:
+            señales["Bid/Ask Spread"] = ("alcista_leve", f"Spread ajustado ({spread:.4f}%)")
+            puntuaciones["Bid/Ask Spread"] = 0.2
+        elif spread > 0.05:
+            señales["Bid/Ask Spread"] = ("bajista_leve", f"Spread amplio ({spread:.4f}%)")
+            puntuaciones["Bid/Ask Spread"] = -0.3
+        else:
+            señales["Bid/Ask Spread"] = ("neutro", f"Spread normal ({spread:.4f}%)")
+            puntuaciones["Bid/Ask Spread"] = 0.0
+    else:
+        indicadores["Bid/Ask Spread"] = "N/A"
+        señales["Bid/Ask Spread"] = ("neutro", "Sin datos")
+        puntuaciones["Bid/Ask Spread"] = 0.0
+
+    # ── 15. Buy/Sell Ratio — REAL de OKX si disponible ──
+    okx_trades_data = futures_data.get("okx_trades")
+    if okx_trades_data:
+        bs_ratio = okx_trades_data["buy_ratio"]
+        n_trades = okx_trades_data["n_trades"]
+        indicadores["Buy/Sell Ratio"] = f"{bs_ratio:.1f}% buy (OKX {n_trades}t)"
+        src_bs = "OKX real"
+    else:
+        taker_buy  = df["taker_buy_quote"].tail(10).sum()
+        taker_sell = (df["quote_volume"] - df["taker_buy_quote"]).tail(10).sum()
+        total_t    = taker_buy + taker_sell
+        bs_ratio   = taker_buy / total_t * 100 if total_t > 0 else 50
+        indicadores["Buy/Sell Ratio"] = f"{bs_ratio:.1f}% buy (Kraken est.)"
+        src_bs = "Kraken estimado"
+
+    if bs_ratio > 60:
+        señales["Buy/Sell Ratio"] = ("alcista", f"Compradores dominan {bs_ratio:.0f}% [{src_bs}]")
+        puntuaciones["Buy/Sell Ratio"] = min(1.0, (bs_ratio - 50) / 25)
+    elif bs_ratio < 40:
+        señales["Buy/Sell Ratio"] = ("bajista", f"Vendedores dominan {bs_ratio:.0f}% [{src_bs}]")
+        puntuaciones["Buy/Sell Ratio"] = max(-1.0, (bs_ratio - 50) / 25)
+    else:
+        señales["Buy/Sell Ratio"] = ("neutro", f"Equilibrio {bs_ratio:.0f}% [{src_bs}]")
+        puntuaciones["Buy/Sell Ratio"] = (bs_ratio - 50) / 50
+
+    # ── 16. Actividad Trades ──
+    trades_pm  = df["trades"].tail(5).mean()
+    trades_max = df["trades"].max()
+    trades_pct = trades_pm / trades_max * 100 if trades_max > 0 else 50
+    indicadores["Actividad Trades"] = f"{trades_pm:.0f} t/min (media 5m)"
+    if trades_pct > 70:
+        cambio_5m = (close.iloc[-1] / close.iloc[-6] - 1) * 100 if len(close) >= 6 else 0
+        if cambio_5m > 0:
+            señales["Actividad Trades"] = ("alcista", f"Alta actividad subida ({trades_pct:.0f}%)")
+            puntuaciones["Actividad Trades"] = 0.7
+        else:
+            señales["Actividad Trades"] = ("bajista", f"Alta actividad bajada ({trades_pct:.0f}%)")
+            puntuaciones["Actividad Trades"] = -0.7
+    else:
+        señales["Actividad Trades"] = ("neutro", f"Actividad normal ({trades_pct:.0f}%)")
+        puntuaciones["Actividad Trades"] = 0.0
+
+    # ── 17. Funding Rate — OKX real ──
+    fr = futures_data.get("funding_rate")
+    if fr is not None:
+        fr_pct = fr * 100
+        next_fr = futures_data.get("next_funding_rate")
+        next_txt = f" → {next_fr*100:+.4f}%" if next_fr else ""
+        indicadores["Funding Rate"] = f"{fr_pct:+.4f}%{next_txt} [OKX]"
+        if fr_pct > 0.05:
+            señales["Funding Rate"] = ("bajista_leve", f"Longs pagando alto ({fr_pct:+.4f}%)")
+            puntuaciones["Funding Rate"] = -min(1.0, fr_pct / 0.08)
+        elif fr_pct < -0.05:
+            señales["Funding Rate"] = ("alcista_leve", f"Shorts pagando ({fr_pct:+.4f}%)")
+            puntuaciones["Funding Rate"] = min(1.0, abs(fr_pct) / 0.08)
+        else:
+            señales["Funding Rate"] = ("neutro", f"FR neutro ({fr_pct:+.4f}%)")
+            puntuaciones["Funding Rate"] = 0.0
+    else:
+        indicadores["Funding Rate"] = "N/A"
+        señales["Funding Rate"] = ("neutro", "Sin datos OKX")
+        puntuaciones["Funding Rate"] = 0.0
+
+    # ── 18. Open Interest Δ — OKX real ──
+    oi_chg = futures_data.get("oi_change_pct")
+    if oi_chg is not None:
+        cambio_precio = (close.iloc[-1] / close.iloc[-6] - 1) * 100 if len(close) >= 6 else 0
+        indicadores["Open Interest Δ"] = f"{oi_chg:+.3f}% (5m) [OKX]"
+        if oi_chg > 0.5 and cambio_precio > 0:
+            señales["Open Interest Δ"] = ("alcista", "OI↑ + precio↑ → tendencia real")
+            puntuaciones["Open Interest Δ"] = 0.8
+        elif oi_chg > 0.5 and cambio_precio < 0:
+            señales["Open Interest Δ"] = ("bajista", "OI↑ + precio↓ → más shorts")
+            puntuaciones["Open Interest Δ"] = -0.8
+        elif oi_chg < -0.5 and cambio_precio > 0:
+            señales["Open Interest Δ"] = ("alcista_leve", "OI↓ + precio↑ → shorts cerrando")
+            puntuaciones["Open Interest Δ"] = 0.5
+        else:
+            señales["Open Interest Δ"] = ("neutro", f"OI sin tendencia ({oi_chg:+.3f}%)")
+            puntuaciones["Open Interest Δ"] = 0.0
+    else:
+        indicadores["Open Interest Δ"] = "N/A"
+        señales["Open Interest Δ"] = ("neutro", "Sin datos OKX")
+        puntuaciones["Open Interest Δ"] = 0.0
+
+    # ── 19. Long/Short Ratio — OKX real ──
+    lr = futures_data.get("long_ratio")
+    sr = futures_data.get("short_ratio")
+    if lr is not None and sr is not None:
+        lr_pct, sr_pct = lr * 100, sr * 100
+        indicadores["Long/Short Ratio"] = f"L={lr_pct:.1f}% / S={sr_pct:.1f}% [OKX]"
+        if lr_pct > 60:
+            señales["Long/Short Ratio"] = ("bajista_leve", f"Exceso longs ({lr_pct:.0f}%) → contrarian")
+            puntuaciones["Long/Short Ratio"] = -0.4
+        elif sr_pct > 60:
+            señales["Long/Short Ratio"] = ("alcista_leve", f"Exceso shorts ({sr_pct:.0f}%) → contrarian")
+            puntuaciones["Long/Short Ratio"] = 0.4
+        else:
+            señales["Long/Short Ratio"] = ("neutro", f"Ratio equilibrado ({lr_pct:.0f}/{sr_pct:.0f})")
+            puntuaciones["Long/Short Ratio"] = 0.0
+    else:
+        indicadores["Long/Short Ratio"] = "N/A"
+        señales["Long/Short Ratio"] = ("neutro", "Sin datos OKX")
+        puntuaciones["Long/Short Ratio"] = 0.0
+
+    # ── 20. Tendencia 5m TF ──
+    if df5 is not None and len(df5) >= 5:
+        close5  = df5["close"]
+        ema7_5  = close5.ewm(span=7).mean().iloc[-1]
+        trend5  = (close5.iloc[-1] / close5.iloc[-5] - 1) * 100
+        indicadores["Tendencia 5m TF"] = f"EMA7={ema7_5:.4f} Δ={trend5:+.3f}%"
+        if close5.iloc[-1] > ema7_5 and trend5 > 0.1:
+            señales["Tendencia 5m TF"] = ("alcista", f"5m alcista ({trend5:+.3f}%)")
+            puntuaciones["Tendencia 5m TF"] = 0.8
+        elif close5.iloc[-1] < ema7_5 and trend5 < -0.1:
+            señales["Tendencia 5m TF"] = ("bajista", f"5m bajista ({trend5:+.3f}%)")
+            puntuaciones["Tendencia 5m TF"] = -0.8
+        else:
+            señales["Tendencia 5m TF"] = ("neutro", f"5m lateral ({trend5:+.3f}%)")
+            puntuaciones["Tendencia 5m TF"] = 0.0
+    else:
+        indicadores["Tendencia 5m TF"] = "N/A"
+        señales["Tendencia 5m TF"] = ("neutro", "Sin datos")
+        puntuaciones["Tendencia 5m TF"] = 0.0
+
+    # ════════════════════════════════════════════
+    # NUEVOS INDICADORES — NIVEL 1 Y 2
+    # ════════════════════════════════════════════
+
+    # ── N1. Fear & Greed Index ──
+    fng_val = futures_data.get("fng_value")
+    fng_cls = futures_data.get("fng_class", "")
+    fng_trn = futures_data.get("fng_trend", 0)
+    if fng_val is not None:
+        indicadores["Fear & Greed"] = f"{fng_val} — {fng_cls} (Δ{fng_trn:+d})"
+        if fng_val <= 20:
+            señales["Fear & Greed"] = ("alcista", f"Miedo extremo ({fng_val}) → oportunidad")
+            puntuaciones["Fear & Greed"] = 0.8
+        elif fng_val <= 40:
+            señales["Fear & Greed"] = ("alcista_leve", f"Miedo ({fng_val}) → sesgo alcista")
+            puntuaciones["Fear & Greed"] = 0.3
+        elif fng_val >= 80:
+            señales["Fear & Greed"] = ("bajista", f"Codicia extrema ({fng_val}) → precaución")
+            puntuaciones["Fear & Greed"] = -0.8
+        elif fng_val >= 60:
+            señales["Fear & Greed"] = ("bajista_leve", f"Codicia ({fng_val}) → sesgo bajista")
+            puntuaciones["Fear & Greed"] = -0.3
+        else:
+            señales["Fear & Greed"] = ("neutro", f"Neutro ({fng_val})")
+            puntuaciones["Fear & Greed"] = 0.0
+    else:
+        indicadores["Fear & Greed"] = "N/A"
+        señales["Fear & Greed"] = ("neutro", "Sin datos")
+        puntuaciones["Fear & Greed"] = 0.0
+
+    # ── N2. Tendencia 15m TF ──
+    if df15 is not None and len(df15) >= 8:
+        c15     = df15["close"]
+        ema9_15 = c15.ewm(span=9).mean()
+        ema21_15 = c15.ewm(span=21).mean()
+        t15     = (c15.iloc[-1] / c15.iloc[-5] - 1) * 100
+        e9, e21 = ema9_15.iloc[-1], ema21_15.iloc[-1]
+        indicadores["Tendencia 15m TF"] = f"EMA9={e9:.4f} EMA21={e21:.4f} Δ={t15:+.3f}%"
+        if c15.iloc[-1] > e9 > e21 and t15 > 0.15:
+            señales["Tendencia 15m TF"] = ("alcista", f"15m alcista fuerte ({t15:+.3f}%)")
+            puntuaciones["Tendencia 15m TF"] = 1.0
+        elif c15.iloc[-1] > e9 and t15 > 0:
+            señales["Tendencia 15m TF"] = ("alcista_leve", f"15m alcista ({t15:+.3f}%)")
+            puntuaciones["Tendencia 15m TF"] = 0.5
+        elif c15.iloc[-1] < e9 < e21 and t15 < -0.15:
+            señales["Tendencia 15m TF"] = ("bajista", f"15m bajista fuerte ({t15:+.3f}%)")
+            puntuaciones["Tendencia 15m TF"] = -1.0
+        elif c15.iloc[-1] < e9 and t15 < 0:
+            señales["Tendencia 15m TF"] = ("bajista_leve", f"15m bajista ({t15:+.3f}%)")
+            puntuaciones["Tendencia 15m TF"] = -0.5
+        else:
+            señales["Tendencia 15m TF"] = ("neutro", f"15m lateral ({t15:+.3f}%)")
+            puntuaciones["Tendencia 15m TF"] = 0.0
+    else:
+        indicadores["Tendencia 15m TF"] = "N/A"
+        señales["Tendencia 15m TF"] = ("neutro", "Sin datos")
+        puntuaciones["Tendencia 15m TF"] = 0.0
+
+    # ── N3. Tendencia 1h TF ──
+    if df1h is not None and len(df1h) >= 8:
+        c1h     = df1h["close"]
+        ema9_1h = c1h.ewm(span=9).mean()
+        ema21_1h = c1h.ewm(span=21).mean()
+        t1h     = (c1h.iloc[-1] / c1h.iloc[-4] - 1) * 100
+        e9h, e21h = ema9_1h.iloc[-1], ema21_1h.iloc[-1]
+        indicadores["Tendencia 1h TF"] = f"EMA9={e9h:.4f} EMA21={e21h:.4f} Δ={t1h:+.3f}%"
+        if c1h.iloc[-1] > e9h > e21h and t1h > 0.3:
+            señales["Tendencia 1h TF"] = ("alcista", f"1h alcista fuerte ({t1h:+.3f}%)")
+            puntuaciones["Tendencia 1h TF"] = 1.0
+        elif c1h.iloc[-1] > e9h and t1h > 0:
+            señales["Tendencia 1h TF"] = ("alcista_leve", f"1h alcista ({t1h:+.3f}%)")
+            puntuaciones["Tendencia 1h TF"] = 0.5
+        elif c1h.iloc[-1] < e9h < e21h and t1h < -0.3:
+            señales["Tendencia 1h TF"] = ("bajista", f"1h bajista fuerte ({t1h:+.3f}%)")
+            puntuaciones["Tendencia 1h TF"] = -1.0
+        elif c1h.iloc[-1] < e9h and t1h < 0:
+            señales["Tendencia 1h TF"] = ("bajista_leve", f"1h bajista ({t1h:+.3f}%)")
+            puntuaciones["Tendencia 1h TF"] = -0.5
+        else:
+            señales["Tendencia 1h TF"] = ("neutro", f"1h lateral ({t1h:+.3f}%)")
+            puntuaciones["Tendencia 1h TF"] = 0.0
+    else:
+        indicadores["Tendencia 1h TF"] = "N/A"
+        señales["Tendencia 1h TF"] = ("neutro", "Sin datos")
+        puntuaciones["Tendencia 1h TF"] = 0.0
+
+    # ── N4. Hurst Exponent — régimen de mercado ──
+    h_val = hurst_exponent(close, max_lag=min(20, len(close) // 4))
+    regimen = clasificar_regimen(h_val)
+    regimen_labels = {
+        "trending":       "TENDENCIA",
+        "mean_reverting": "REVERSIÓN",
+        "noise":          "RUIDO/LATERAL",
+    }
+    regimen_colors = {
+        "trending":       "alcista_leve",
+        "mean_reverting": "bajista_leve",
+        "noise":          "neutro",
+    }
+    indicadores["Hurst / Régimen"] = f"H={h_val:.3f} → {regimen_labels[regimen]}"
+    señales["Hurst / Régimen"] = (regimen_colors[regimen],
+                                   f"H={h_val:.3f}: mercado en {regimen_labels[regimen]}")
+    puntuaciones["Hurst / Régimen"] = 0.0  # solo contexto, no puntúa directamente
+
+    # ── N5. Divergencia de precio multi-exchange ──
+    price_div = futures_data.get("price_diverge")
+    if price_div is not None:
+        okx_p = info.get("okx_price", 0)
+        indicadores["Divergencia Exchange"] = (
+            f"Kraken vs OKX: {price_div:+.4f}% "
+            f"(OKX=${okx_p:,.4f})"
+        )
+        if abs(price_div) > 0.05:
+            # Precio de Kraken por encima de OKX → probablemente corrija a la baja
+            if price_div > 0.05:
+                señales["Divergencia Exchange"] = ("bajista_leve",
+                    f"Kraken {price_div:+.4f}% sobre OKX → posible corrección")
+                puntuaciones["Divergencia Exchange"] = -0.3
+            else:
+                señales["Divergencia Exchange"] = ("alcista_leve",
+                    f"Kraken {price_div:+.4f}% bajo OKX → posible rebote")
+                puntuaciones["Divergencia Exchange"] = 0.3
+        else:
+            señales["Divergencia Exchange"] = ("neutro",
+                f"Precios alineados ({price_div:+.4f}%)")
+            puntuaciones["Divergencia Exchange"] = 0.0
+    else:
+        indicadores["Divergencia Exchange"] = "N/A (OKX no disponible)"
+        señales["Divergencia Exchange"] = ("neutro", "Sin datos OKX")
+        puntuaciones["Divergencia Exchange"] = 0.0
+
+    return indicadores, señales, puntuaciones, atr_pct, regimen, h_val
+
+
+# ─────────────────────────────────────────────
+# PESOS BASE
+# ─────────────────────────────────────────────
+PESOS_BASE = PESOS_CRYPTO = {
+    # Indicadores técnicos originales
+    "RSI (9)":              1.5,
+    "MACD (5,13,3)":        1.5,
+    "EMA 7/25":             1.2,
+    "Bollinger %B":         1.0,
+    "Stochastic (5,3)":     1.0,
+    "Williams %R":          0.8,
+    "ATR (9)":              0.0,
+    "Rate of Change":       1.8,
+    "OBV":                  1.0,
+    "VWAP Desviación":      1.2,
+    "Volumen Relativo":     1.3,
+    "Patrón Vela 1m":       0.7,
+    "Order Book Imbalance": 2.0,
+    "Bid/Ask Spread":       0.5,
+    "Buy/Sell Ratio":       2.0,
+    "Actividad Trades":     0.8,
+    "Funding Rate":         1.0,
+    "Open Interest Δ":      1.0,
+    "Long/Short Ratio":     0.6,
+    "Tendencia 5m TF":      1.5,
+    # Nuevos
+    "Fear & Greed":         1.2,
+    "Tendencia 15m TF":     1.8,
+    "Tendencia 1h TF":      2.0,
+    "Hurst / Régimen":      0.0,   # informativo
+    "Divergencia Exchange": 0.8,
+}
+
+# Pesos por régimen — amplificadores sobre PESOS_BASE
+_REGIME_MULT = {
+    # En tendencia: momentum y continuación tienen más peso
+    "trending": {
+        "Rate of Change":   1.4,
+        "EMA 7/25":         1.4,
+        "MACD (5,13,3)":    1.3,
+        "Tendencia 15m TF": 1.3,
+        "Tendencia 1h TF":  1.3,
+        "RSI (9)":          0.7,   # OSC menos útiles en tendencia
+        "Bollinger %B":     0.7,
+        "Stochastic (5,3)": 0.7,
+        "Williams %R":      0.7,
+    },
+    # En reversión: osciladores y niveles extremos tienen más peso
+    "mean_reverting": {
+        "RSI (9)":          1.4,
+        "Bollinger %B":     1.4,
+        "Stochastic (5,3)": 1.3,
+        "Williams %R":      1.3,
+        "VWAP Desviación":  1.3,
+        "Rate of Change":   0.6,   # momentum menos fiable en reversión
+        "EMA 7/25":         0.7,
+        "MACD (5,13,3)":    0.7,
+    },
+    # En ruido: microestructura y datos de derivados tienen más peso
+    "noise": {
+        "Order Book Imbalance": 1.3,
+        "Buy/Sell Ratio":       1.3,
+        "Funding Rate":         1.2,
+        "Long/Short Ratio":     1.2,
+    },
+}
+
+BLOQUES_CRYPTO = {
+    "⚡ Momentum Técnico":     ["RSI (9)", "MACD (5,13,3)", "EMA 7/25",
+                                "Bollinger %B", "Stochastic (5,3)", "Williams %R"],
+    "📊 Volatilidad y Precio": ["ATR (9)", "Rate of Change", "VWAP Desviación",
+                                "Patrón Vela 1m"],
+    "📦 Volumen y Flujo":      ["OBV", "Volumen Relativo", "Buy/Sell Ratio",
+                                "Actividad Trades"],
+    "🏦 Microestructura":      ["Order Book Imbalance", "Bid/Ask Spread",
+                                "Divergencia Exchange"],
+    "🔮 Futuros / Derivados":  ["Funding Rate", "Open Interest Δ", "Long/Short Ratio"],
+    "🌐 Contexto Multi-TF":    ["Tendencia 5m TF", "Tendencia 15m TF",
+                                "Tendencia 1h TF", "Hurst / Régimen"],
+    "🧠 Sentimiento Macro":    ["Fear & Greed"],
+}
+
+
+# ─────────────────────────────────────────────
+# PREDICCIÓN — CON MODULADORES
+# ─────────────────────────────────────────────
+def calcular_prediccion(puntuaciones, precio_actual, indicadores,
+                        regimen: str = "noise", fng_data: dict = None):
+    # ATR
+    atr_str = indicadores.get("ATR (9)", "±0 (±0%)")
+    try:
+        atr_pct = float(atr_str.split("±")[2].replace("%)", "").replace("%", ""))
+    except Exception:
+        atr_pct = 0.1
+
+    # ── Pesos dinámicos según régimen ──
+    mults = _REGIME_MULT.get(regimen, {})
+    pesos_efectivos = {
+        k: v * mults.get(k, 1.0)
+        for k, v in PESOS_BASE.items()
+    }
+
+    # ── Score ponderado ──
+    score_pond = sum(
+        puntuaciones.get(k, 0) * pesos_efectivos.get(k, 1.0)
+        for k in puntuaciones
+    )
+    peso_total = sum(v for v in pesos_efectivos.values() if v > 0)
+    score_norm = max(-1.0, min(1.0, score_pond / peso_total)) if peso_total else 0
+
+    # ── Modulador Fear & Greed ──
+    # No cambia la dirección, solo ajusta la confianza (max ±10%)
+    fng_mod = 1.0
+    fng_val = fng_data.get("fng_value") if fng_data else None
+    if fng_val is not None:
+        if score_norm > 0:
+            # Señal alcista: F&G bajo aumenta confianza (oversold sentiment)
+            if fng_val <= 20:
+                fng_mod = 1.10
+            elif fng_val <= 40:
+                fng_mod = 1.05
+            elif fng_val >= 80:
+                fng_mod = 0.90   # demasiada euforia → contrarian
+            elif fng_val >= 60:
+                fng_mod = 0.95
+        else:
+            # Señal bajista: F&G alto aumenta confianza (overbought sentiment)
+            if fng_val >= 80:
+                fng_mod = 1.10
+            elif fng_val >= 60:
+                fng_mod = 1.05
+            elif fng_val <= 20:
+                fng_mod = 0.90   # demasiado miedo → contrarian rebote
+            elif fng_val <= 40:
+                fng_mod = 0.95
+
+    # ── Modulador Multi-TF alignment ──
+    # Si 15m y 1h confirman la señal de 1m, boost confianza
+    tf_align = 0
+    p15 = puntuaciones.get("Tendencia 15m TF", 0)
+    p1h = puntuaciones.get("Tendencia 1h TF", 0)
+    if score_norm > 0:
+        if p15 > 0: tf_align += 1
+        if p1h > 0: tf_align += 1
+    elif score_norm < 0:
+        if p15 < 0: tf_align += 1
+        if p1h < 0: tf_align += 1
+    tf_mod = 1.0 + tf_align * 0.05   # max +10% si ambos TF confirman
+
+    # ── Modulador régimen ──
+    # En "noise" reducir la confianza general
+    regime_conf = {"trending": 1.05, "mean_reverting": 1.0, "noise": 0.92}
+    regime_mod  = regime_conf.get(regimen, 1.0)
+
+    # Score final modulado
+    score_final = max(-1.0, min(1.0, score_norm * fng_mod * tf_mod * regime_mod))
+
+    # Probabilidad
+    prob_subida = max(5.0, min(95.0, 50.0 + score_final * 40.0))
+
+    # Movimiento estimado
+    mov_est    = atr_pct * (0.6 + abs(score_final) * 0.6)
+    precio_obj = precio_actual * (1 + (mov_est if score_final > 0 else -mov_est) / 100)
+
+    if score_final > 0.4:
+        señal_texto, señal_color = "ALCISTA FUERTE",   "alcista"
+    elif score_final > 0.15:
+        señal_texto, señal_color = "TENDENCIA ALCISTA","alcista_leve"
+    elif score_final < -0.4:
+        señal_texto, señal_color = "BAJISTA FUERTE",   "bajista"
+    elif score_final < -0.15:
+        señal_texto, señal_color = "TENDENCIA BAJISTA","bajista_leve"
+    else:
+        señal_texto, señal_color = "LATERAL / INDECISO","neutro"
+
+    alcistas = sum(1 for v in puntuaciones.values() if v > 0)
+    bajistas = sum(1 for v in puntuaciones.values() if v < 0)
+    neutros  = sum(1 for v in puntuaciones.values() if v == 0)
+
+    return {
+        "score":           score_final,
+        "score_raw":       score_norm,
+        "prob_subida":     prob_subida,
+        "prob_bajada":     100 - prob_subida,
+        "direccion":       "↑ SUBE" if score_final > 0 else "↓ BAJA",
+        "mov_estimado":    mov_est,
+        "precio_objetivo": precio_obj,
+        "señal_texto":     señal_texto,
+        "señal_color":     señal_color,
+        "atr_pct":         atr_pct,
+        "alcistas":        alcistas,
+        "bajistas":        bajistas,
+        "neutros":         neutros,
+        "regimen":         regimen,
+        "fng_mod":         round(fng_mod, 3),
+        "tf_align":        tf_align,
+        "tf_mod":          round(tf_mod, 3),
+        "regime_mod":      round(regime_mod, 3),
+        "pesos_efectivos": pesos_efectivos,
+    }
