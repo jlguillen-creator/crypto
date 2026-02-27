@@ -1145,6 +1145,25 @@ def calcular_prediccion(puntuaciones, precio_actual, indicadores,
     peso_total = sum(v for v in pesos_efectivos.values() if v > 0)
     score_norm = max(-1.0, min(1.0, score_pond / peso_total)) if peso_total else 0
 
+    # ── Consenso — penalizar cuando los indicadores se contradicen ──
+    # Si hay muchos alcistas Y bajistas a la vez, la señal es poco fiable
+    vals = [v for v in puntuaciones.values() if v != 0]
+    if vals:
+        n_alc_c = sum(1 for v in vals if v > 0)
+        n_baj_c = sum(1 for v in vals if v < 0)
+        n_total = len(vals)
+        # Consenso: 1.0 si todos van en la misma dirección, 0.0 si 50/50
+        mayoria = max(n_alc_c, n_baj_c)
+        consenso = (mayoria / n_total - 0.5) * 2   # escala 0..1
+        consenso = max(0.0, consenso)
+    else:
+        consenso = 0.0
+
+    # Amplificar score con el consenso: si todos coinciden, el score pesa más
+    # Si hay contradicción total, el score se reduce a la mitad
+    consensus_mult = 0.5 + consenso * 0.7   # rango 0.5 .. 1.2
+    score_norm = max(-1.0, min(1.0, score_norm * consensus_mult))
+
     # ── Modulador Fear & Greed ──
     # No cambia la dirección, solo ajusta la confianza (max ±10%)
     fng_mod = 1.0
@@ -1192,20 +1211,28 @@ def calcular_prediccion(puntuaciones, precio_actual, indicadores,
     # Score final modulado
     score_final = max(-1.0, min(1.0, score_norm * fng_mod * tf_mod * regime_mod))
 
-    # Probabilidad
-    prob_subida = max(5.0, min(95.0, 50.0 + score_final * 40.0))
+    # ── Probabilidad — curva sigmoide en vez de lineal ──
+    # tanh amplifica diferencias pequeñas de score sin llegar a extremos falsos
+    # score 0.10 → 61%  (antes: 54%)
+    # score 0.20 → 71%  (antes: 58%)
+    # score 0.30 → 79%  (antes: 62%)
+    prob_subida = 50.0 + 45.0 * float(np.tanh(score_final * 2.5))
+    prob_subida = max(5.0, min(95.0, prob_subida))
 
     # Movimiento estimado
     mov_est    = atr_pct * (0.6 + abs(score_final) * 0.6)
     precio_obj = precio_actual * (1 + (mov_est if score_final > 0 else -mov_est) / 100)
 
-    if score_final > 0.4:
+    # Umbrales ajustados a la nueva escala sigmoide
+    # score 0.25 → prob ~73%  (antes se llamaba FUERTE a partir de 0.4)
+    # score 0.12 → prob ~63%  (antes TENDENCIA a partir de 0.15)
+    if score_final > 0.30:
         señal_texto, señal_color = "ALCISTA FUERTE",   "alcista"
-    elif score_final > 0.15:
+    elif score_final > 0.10:
         señal_texto, señal_color = "TENDENCIA ALCISTA","alcista_leve"
-    elif score_final < -0.4:
+    elif score_final < -0.30:
         señal_texto, señal_color = "BAJISTA FUERTE",   "bajista"
-    elif score_final < -0.15:
+    elif score_final < -0.10:
         señal_texto, señal_color = "TENDENCIA BAJISTA","bajista_leve"
     else:
         señal_texto, señal_color = "LATERAL / INDECISO","neutro"
