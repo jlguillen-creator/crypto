@@ -14,7 +14,7 @@ import warnings
 from datetime import datetime, timezone
 from crypto_predictor import (
     descargar_datos, calcular_indicadores,
-    calcular_prediccion, BLOQUES_CRYPTO, PESOS_CRYPTO,
+    calcular_prediccion, BLOQUES_CRYPTO, PESOS_BASE,
     normalizar_symbol
 )
 
@@ -316,15 +316,15 @@ with top_c3:
     top_analyze = st.button("⚡ ANALIZAR", key="top_btn",
                             use_container_width=True, type="primary")
 
-# Chips de selección rápida — 2 filas de 6
-chip_cols1 = st.columns(6)
-chip_cols2 = st.columns(6)
+# Chips de selección rápida — 2 columnas (legibles en móvil)
 chip_selected = None
-for i, (sym_k, label) in enumerate(CRYPTOS):
-    col = chip_cols1[i] if i < 6 else chip_cols2[i - 6]
-    with col:
-        if st.button(label, key=f"chip_{sym_k}", use_container_width=True):
-            chip_selected = sym_k
+chip_rows = [CRYPTOS[i:i+2] for i in range(0, len(CRYPTOS), 2)]
+for row in chip_rows:
+    cols = st.columns(2)
+    for j, (sym_k, label) in enumerate(row):
+        with cols[j]:
+            if st.button(label, key=f"chip_{sym_k}", use_container_width=True):
+                chip_selected = sym_k
 
 st.markdown("<hr style='border-color:#1e2432; margin:0.5rem 0 1rem;'>", unsafe_allow_html=True)
 
@@ -396,17 +396,18 @@ if not do_analyze:
 # ─────────────────────────────────────────────
 kraken_pair, sym_display = normalizar_symbol(symbol_final)
 
-with st.spinner(f"Conectando con Kraken · {sym_display}…"):
-    df, df5, book, futures_data, info, error = descargar_datos(symbol_final)
+with st.spinner(f"Conectando con Kraken · {sym_display} · OKX · F&G…"):
+    df, df5, book, futures_data, info, error, df15, df1h = descargar_datos(symbol_final)
 
 if error or df is None:
     st.error(f"❌ {error}")
     st.stop()
 
 with st.spinner("Calculando 20 indicadores…"):
-    indicadores, señales, puntuaciones, atr_pct = calcular_indicadores(
-        df, df5, book, futures_data, info)
-    pred = calcular_prediccion(puntuaciones, info["precio_actual"], indicadores)
+    indicadores, señales, puntuaciones, atr_pct, regimen, hurst_val = calcular_indicadores(
+        df, df5, book, futures_data, info, df15, df1h)
+    pred = calcular_prediccion(puntuaciones, info["precio_actual"], indicadores,
+                              regimen=regimen, fng_data=futures_data)
 
 # ── Pre-calcular TODAS las variables antes de cualquier f-string HTML ──
 precio         = info["precio_actual"]
@@ -448,18 +449,72 @@ acento80       = acento + "80"
 st.markdown(f'<style>.hero{{--acc:{acento};--acc-glow:{glow};}}.target-box{{--acc:{acento};}}</style>',
             unsafe_allow_html=True)
 
-h1, h2, h3 = st.columns([3, 3, 2])
+# ══════════════════════════════════════════════
+# FILA 1 — PREDICCIÓN (lo más importante, primero)
+# Dirección grande + Prob subida + Prob bajada + Rango
+# ══════════════════════════════════════════════
+c_up = "#00e87a" if prob_up > 55 else ("#ff4f6a" if prob_up < 45 else "#f5a623")
+c_dn = "#ff4f6a" if prob_dn > 55 else ("#00e87a" if prob_dn < 45 else "#f5a623")
 
-with h1:
+p1, p2, p3, p4 = st.columns([3, 2, 2, 2])
+
+with p1:
+    # Caja de dirección — texto más grande, es el resultado final
     st.markdown(
-        '<div class="hero">'
+        '<div class="hero" style="height:100%;">'
         f'<div class="hero-label">&#9889; {sym_display} &middot; PREDICCI&Oacute;N +5 MINUTOS &middot; {ts}</div>'
-        f'<div class="hero-dir">{direccion}</div>'
-        f'<div><span class="hero-badge" style="color:{acento}; border-color:{acento80};">'
+        f'<div class="hero-dir" style="font-size:4.5rem;">{direccion}</div>'
+        f'<div><span class="hero-badge" style="color:{acento}; border-color:{acento80}; font-size:0.82rem; padding:0.35rem 1rem;">'
         f'{señal_texto}</span></div>'
         '</div>',
         unsafe_allow_html=True
     )
+
+with p2:
+    st.markdown(
+        '<div class="pbox" style="height:100%; box-sizing:border-box;">'
+        '<div class="pbox-lbl" style="font-size:0.68rem; letter-spacing:3px;">PROB SUBIDA</div>'
+        f'<div class="pbox-val" style="color:{c_up}; font-size:3rem;">{prob_up:.1f}%</div>'
+        '<div class="pbar-track" style="height:7px; margin-top:0.7rem;">'
+        f'<div class="pbar-fill" style="width:{prob_up}%; background:{c_up}; box-shadow:0 0 10px {c_up}60;"></div>'
+        '</div>'
+        '<div class="pbox-sub" style="font-size:0.68rem; margin-top:0.5rem;">pr&oacute;ximos 5 min</div>'
+        '</div>',
+        unsafe_allow_html=True
+    )
+
+with p3:
+    st.markdown(
+        '<div class="pbox" style="height:100%; box-sizing:border-box;">'
+        '<div class="pbox-lbl" style="font-size:0.68rem; letter-spacing:3px;">PROB BAJADA</div>'
+        f'<div class="pbox-val" style="color:{c_dn}; font-size:3rem;">{prob_dn:.1f}%</div>'
+        '<div class="pbar-track" style="height:7px; margin-top:0.7rem;">'
+        f'<div class="pbar-fill" style="width:{prob_dn}%; background:{c_dn}; box-shadow:0 0 10px {c_dn}60;"></div>'
+        '</div>'
+        '<div class="pbox-sub" style="font-size:0.68rem; margin-top:0.5rem;">pr&oacute;ximos 5 min</div>'
+        '</div>',
+        unsafe_allow_html=True
+    )
+
+with p4:
+    st.markdown(
+        '<div class="pbox" style="height:100%; box-sizing:border-box;">'
+        '<div class="pbox-lbl" style="font-size:0.68rem; letter-spacing:3px;">RANGO ESTIMADO</div>'
+        f'<div class="pbox-val" style="color:{acento}; font-size:2.4rem;">&plusmn;{mov_fmt}</div>'
+        '<div style="margin-top:0.6rem; font-family:\'IBM Plex Mono\',monospace; font-weight:700; line-height:2.0;">'
+        f'<div style="font-size:0.82rem; color:#00e87a;">&#9650; {rng_hi_fmt}</div>'
+        f'<div style="font-size:0.82rem; color:#ff4f6a;">&#9660; {rng_lo_fmt}</div>'
+        '</div>'
+        '</div>',
+        unsafe_allow_html=True
+    )
+
+st.markdown("<div style='margin:0.7rem 0;'></div>", unsafe_allow_html=True)
+
+# ══════════════════════════════════════════════
+# FILA 2 — PRECIO ACTUAL + SCORE + OBJETIVO
+# ══════════════════════════════════════════════
+h2, h3 = st.columns([3, 2])
 
 with h2:
     st.markdown(
@@ -493,51 +548,6 @@ with h3:
         unsafe_allow_html=True
     )
 
-# ── Barras de probabilidad ──
-pc1, pc2, pc3 = st.columns(3)
-
-c_up = "#00e87a" if prob_up > 55 else ("#ff4f6a" if prob_up < 45 else "#f5a623")
-c_dn = "#ff4f6a" if prob_dn > 55 else ("#00e87a" if prob_dn < 45 else "#f5a623")
-
-with pc1:
-    st.markdown(
-        '<div class="pbox">'
-        '<div class="pbox-lbl">PROB SUBIDA</div>'
-        f'<div class="pbox-val" style="color:{c_up};">{prob_up:.1f}%</div>'
-        '<div class="pbar-track">'
-        f'<div class="pbar-fill" style="width:{prob_up}%; background:{c_up}; box-shadow:0 0 8px {c_up}60;"></div>'
-        '</div>'
-        '<div class="pbox-sub">pr&oacute;ximos 5 min</div>'
-        '</div>',
-        unsafe_allow_html=True
-    )
-
-with pc2:
-    st.markdown(
-        '<div class="pbox">'
-        '<div class="pbox-lbl">PROB BAJADA</div>'
-        f'<div class="pbox-val" style="color:{c_dn};">{prob_dn:.1f}%</div>'
-        '<div class="pbar-track">'
-        f'<div class="pbar-fill" style="width:{prob_dn}%; background:{c_dn}; box-shadow:0 0 8px {c_dn}60;"></div>'
-        '</div>'
-        '<div class="pbox-sub">pr&oacute;ximos 5 min</div>'
-        '</div>',
-        unsafe_allow_html=True
-    )
-
-with pc3:
-    st.markdown(
-        '<div class="pbox">'
-        '<div class="pbox-lbl">RANGO ESTIMADO</div>'
-        f'<div class="pbox-val" style="color:{acento};">&plusmn;{mov_fmt}</div>'
-        '<div style="margin-top:0.5rem; font-family:\'IBM Plex Mono\',monospace; font-size:0.72rem; font-weight:700; line-height:2.2;">'
-        f'<span style="color:#00e87a;">{rng_hi_fmt}</span><br>'
-        f'<span style="color:#ff4f6a;">{rng_lo_fmt}</span>'
-        '</div>'
-        '</div>',
-        unsafe_allow_html=True
-    )
-
 st.markdown("<div style='margin:0.7rem 0;'></div>", unsafe_allow_html=True)
 
 # ── Info de mercado ──
@@ -562,6 +572,83 @@ with mc3:
 with mc4:
     st.markdown(f'<div class="icard"><div class="icard-lbl">OPEN INTEREST</div><div class="icard-val">{oi_fmt}</div></div>',
                 unsafe_allow_html=True)
+
+st.markdown("<div style='margin:0.7rem 0;'></div>", unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────
+# PANEL DE RÉGIMEN Y MODULADORES
+# ─────────────────────────────────────────────
+REGIME_LABELS = {
+    "trending":       ("TENDENCIA",   "#4e9eff", "Indicadores de momentum amplificados"),
+    "mean_reverting": ("REVERSIÓN",   "#f5a623", "Osciladores amplificados"),
+    "noise":          ("RUIDO/LATERAL","#6b7894","Microestructura amplificada"),
+}
+reg_label, reg_color, reg_desc = REGIME_LABELS.get(
+    regimen, ("?", "#6b7894", "")
+)
+hurst_fmt    = f"{hurst_val:.3f}"
+fng_val_disp = futures_data.get("fng_value")
+fng_cls_disp = futures_data.get("fng_class", "N/A")
+fng_color    = ("#00e87a" if fng_val_disp and fng_val_disp <= 40 else
+                "#ff4f6a" if fng_val_disp and fng_val_disp >= 60 else "#f5a623")
+fng_disp     = f"{fng_val_disp} — {fng_cls_disp}" if fng_val_disp else "N/A"
+
+book_src_disp  = futures_data.get("book_source", "kraken").upper()
+tf_align_disp  = pred.get("tf_align", 0)
+fng_mod_disp   = pred.get("fng_mod", 1.0)
+tf_mod_disp    = pred.get("tf_mod", 1.0)
+regime_mod_disp= pred.get("regime_mod", 1.0)
+score_raw_disp = pred.get("score_raw", score)
+
+st.markdown(
+    '<div style="background:#0a0c12; border:1px solid #1e2432; border-left:3px solid #4e9eff;'
+    'border-radius:6px; padding:0.9rem 1.2rem; margin-bottom:0.7rem;">'
+    '<div style="font-family:\'IBM Plex Mono\',monospace; font-size:0.58rem; letter-spacing:3px;'
+    'font-weight:700; color:#8892a4; margin-bottom:0.6rem;">ANÁLISIS DE RÉGIMEN Y MODULADORES</div>'
+    '<div style="display:flex; flex-wrap:wrap; gap:1.5rem; align-items:flex-start;">',
+    unsafe_allow_html=True
+)
+
+rm1, rm2, rm3, rm4, rm5 = st.columns(5)
+
+with rm1:
+    st.markdown(
+        f'<div class="icard"><div class="icard-lbl">RÉGIMEN (HURST={hurst_fmt})</div>'
+        f'<div class="icard-val" style="color:{reg_color}; font-size:0.85rem;">{reg_label}</div>'
+        f'<div style="font-family:\'IBM Plex Mono\',monospace; font-size:0.58rem; color:#6b7894; margin-top:0.2rem;">{reg_desc}</div></div>',
+        unsafe_allow_html=True
+    )
+with rm2:
+    st.markdown(
+        f'<div class="icard"><div class="icard-lbl">FEAR &amp; GREED</div>'
+        f'<div class="icard-val" style="color:{fng_color};">{fng_disp}</div>'
+        f'<div style="font-family:\'IBM Plex Mono\',monospace; font-size:0.58rem; color:#6b7894; margin-top:0.2rem;">Mod F&G: ×{fng_mod_disp:.3f}</div></div>',
+        unsafe_allow_html=True
+    )
+with rm3:
+    tf_color = "#00e87a" if tf_align_disp == 2 else ("#f5a623" if tf_align_disp == 1 else "#6b7894")
+    tf_txt   = ["Sin alineación", "15m confirma", "15m + 1h confirman"][tf_align_disp]
+    st.markdown(
+        f'<div class="icard"><div class="icard-lbl">ALINEACIÓN MULTI-TF</div>'
+        f'<div class="icard-val" style="color:{tf_color}; font-size:0.85rem;">{tf_txt}</div>'
+        f'<div style="font-family:\'IBM Plex Mono\',monospace; font-size:0.58rem; color:#6b7894; margin-top:0.2rem;">Mod TF: ×{tf_mod_disp:.3f}</div></div>',
+        unsafe_allow_html=True
+    )
+with rm4:
+    st.markdown(
+        f'<div class="icard"><div class="icard-lbl">ORDER BOOK FUENTE</div>'
+        f'<div class="icard-val" style="color:#4e9eff; font-size:0.85rem;">{book_src_disp}</div>'
+        f'<div style="font-family:\'IBM Plex Mono\',monospace; font-size:0.58rem; color:#6b7894; margin-top:0.2rem;">Mod régimen: ×{regime_mod_disp:.3f}</div></div>',
+        unsafe_allow_html=True
+    )
+with rm5:
+    raw_color = "#00e87a" if score_raw_disp > 0 else ("#ff4f6a" if score_raw_disp < 0 else "#6b7894")
+    st.markdown(
+        f'<div class="icard"><div class="icard-lbl">SCORE BRUTO → FINAL</div>'
+        f'<div class="icard-val" style="color:{raw_color};">{score_raw_disp:+.3f} → {score_fmt}</div>'
+        f'<div style="font-family:\'IBM Plex Mono\',monospace; font-size:0.58rem; color:#6b7894; margin-top:0.2rem;">Ajuste total: ×{fng_mod_disp*tf_mod_disp*regime_mod_disp:.3f}</div></div>',
+        unsafe_allow_html=True
+    )
 
 st.markdown("<div style='margin:0.7rem 0;'></div>", unsafe_allow_html=True)
 
