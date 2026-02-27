@@ -27,7 +27,6 @@ import ssl
 import os
 import urllib3
 from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 warnings.filterwarnings("ignore")
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -349,62 +348,55 @@ def detectar_wash_trading(df: pd.DataFrame) -> float:
 # ─────────────────────────────────────────────
 # DESCARGA PRINCIPAL — PARALELA
 # ─────────────────────────────────────────────
+def _safe_call(fn, *args):
+    """Llama a fn, devuelve None ante cualquier excepción."""
+    try:
+        return fn(*args)
+    except Exception:
+        return None
+
+
 def descargar_datos(symbol: str):
     pair, display = normalizar_symbol(symbol)
     base = _base_from_kraken(pair)
 
-    # ── Test conectividad Kraken ──
-    ping = _get(f"{KRAKEN_BASE}/Time")
-    if ping is None:
-        return None, None, None, None, None, (
-            "No se puede conectar con Kraken API. Comprueba tu conexión."
-        )
-
-    # ── Descarga en paralelo de todas las fuentes ──
-    results = {}
-    def fetch(key, fn, *args):
-        results[key] = fn(*args)
-
-    tasks = {
-        "ohlc_1m":   (_kraken_ohlc, pair, 1, 100),
-        "ohlc_5m":   (_kraken_ohlc, pair, 5, 60),
-        "ohlc_15m":  (_kraken_ohlc, pair, 15, 50),
-        "ohlc_1h":   (_kraken_ohlc, pair, 60, 48),
-        "book_krk":  (_kraken_book, pair),
-        "book_okx":  (_okx_book, base),
-        "trades_okx":(_okx_trades, base),
-        "funding":   (_okx_funding, base),
-        "oi":        (_okx_open_interest, base),
-        "oi_hist":   (_okx_oi_history, base),
-        "ls_ratio":  (_okx_long_short, base),
-        "fng":       (_fear_greed,),
-        "okx_price": (_okx_price, base),
-    }
-
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        futs = {ex.submit(fn, *args): key for key, (fn, *args) in tasks.items()}
-        for fut in as_completed(futs):
-            key = futs[fut]
-            try:
-                results[key] = fut.result()
-            except Exception:
-                results[key] = None
-
-    # ── Validar OHLC 1m (obligatorio) ──
-    df = results.get("ohlc_1m")
+    # ── OHLC 1m — obligatorio ──
+    df = _safe_call(_kraken_ohlc, pair, 1, 100)
     if df is None:
-        assets = _get(f"{KRAKEN_BASE}/AssetPairs", {"pair": pair})
-        if assets and "result" in assets:
-            alt = list(assets["result"].keys())[0]
-            df  = _kraken_ohlc(alt, 1, 100)
+        try:
+            assets = _get(f"{KRAKEN_BASE}/AssetPairs", {"pair": pair})
+            if assets and "result" in assets:
+                alt = list(assets["result"].keys())[0]
+                df  = _safe_call(_kraken_ohlc, alt, 1, 100)
+        except Exception:
+            pass
     if df is None or len(df) < 20:
         return None, None, None, None, None, (
             f"Par '{pair}' no encontrado en Kraken. "
             "Prueba con: BTC, ETH, SOL, XRP, DOGE, ADA, DOT, AVAX, LINK, LTC…"
-        )
+        ), None, None
+
+    # ── OHLC adicionales — opcionales ──
+    df5   = _safe_call(_kraken_ohlc, pair, 5,  60)
+    df15  = _safe_call(_kraken_ohlc, pair, 15, 50)
+    df1h  = _safe_call(_kraken_ohlc, pair, 60, 48)
+
+    # ── Order book: OKX preferido, fallback Kraken ──
+    book_okx = _safe_call(_okx_book,    base)
+    book_krk = _safe_call(_kraken_book, pair)
+    book = book_okx if book_okx else book_krk
+
+    # ── Datos OKX — todos opcionales, nunca bloquean ──
+    okx_trades   = _safe_call(_okx_trades,       base)
+    funding_data = _safe_call(_okx_funding,       base) or {}
+    oi_val       = _safe_call(_okx_open_interest, base)
+    oi_chg       = _safe_call(_okx_oi_history,    base)
+    ls_data      = _safe_call(_okx_long_short,    base) or {}
+    okx_price    = _safe_call(_okx_price,         base)
+    fng          = _safe_call(_fear_greed)
 
     # ── Enriquecer df con taker estimado (mejorado con OKX trades si disponible) ──
-    okx_trades = results.get("trades_okx")
+    # okx_trades already set above
     if okx_trades:
         # Usar ratio real de OKX para distribuir el volumen de las últimas velas
         real_ratio = okx_trades["buy_ratio"] / 100
@@ -422,8 +414,8 @@ def descargar_datos(symbol: str):
     df["trades"] = df["count"]
 
     # ── Order book: preferir OKX (más profundo), fallback Kraken ──
-    book_okx = results.get("book_okx")
-    book_krk = results.get("book_krk")
+    # book_okx already set above
+    # book_krk already set above
     book = book_okx if book_okx else book_krk
 
     # ── Ticker Kraken para precio y 24h stats ──
@@ -443,16 +435,16 @@ def descargar_datos(symbol: str):
         low_24h       = float(tk["l"][1])
 
     # ── Precio OKX para comparación multi-exchange ──
-    okx_price     = results.get("okx_price")
+    # okx_price already set above
     price_diverge = None
     if okx_price and precio_actual > 0:
         price_diverge = (precio_actual - okx_price) / okx_price * 100
 
     # ── Datos de futuros / derivados de OKX ──
-    funding_data  = results.get("funding") or {}
-    oi_val        = results.get("oi")
-    oi_chg        = results.get("oi_hist")
-    ls_data       = results.get("ls_ratio") or {}
+    # funding_data already set above
+    # oi_val already set above
+    # oi_chg already set above
+    # ls_data already set above
 
     futures_data = {
         "funding_rate":      funding_data.get("funding_rate"),
@@ -468,7 +460,7 @@ def descargar_datos(symbol: str):
     }
 
     # ── Fear & Greed ──
-    fng = results.get("fng")
+    # fng already set above
     if fng:
         futures_data["fng_value"]  = fng["value"]
         futures_data["fng_class"]  = fng["classification"]
@@ -487,8 +479,7 @@ def descargar_datos(symbol: str):
         "base":          base,
     }
 
-    return df, results.get("ohlc_5m"), book, futures_data, info, None, \
-           results.get("ohlc_15m"), results.get("ohlc_1h")
+    return df, df5, book, futures_data, info, None, df15, df1h
 
 
 # ─────────────────────────────────────────────
